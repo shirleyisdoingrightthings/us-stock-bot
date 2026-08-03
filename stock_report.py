@@ -3,7 +3,7 @@
 美股收盘日报
 数据源：
   · CNBC quote API: 指数 / 波动率 / 美债 / 美元 / 11 个 GICS 板块 / 重点个股（免费、无需 key）
-  · RSS × 3: CNBC 财经头条 / CNBC 盈利 / Yahoo Finance
+  · RSS × 5: CNBC 财经头条 / CNBC 盈利 / Yahoo Finance / MarketWatch 市场 / Fortune
 由 Claude 写稿：① 收盘仪表盘（指数+板块+异动）② 新闻播报列表，推送 2 条 Telegram HTML 消息。
 本脚本只负责抓取与发送，不含写稿用的第三方大模型 API。
 
@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (sanitize_html, with_retry, fetch_rss, parse_entry_date,
                        already_ran_today, fetch_article_text,
                        url_key, load_sent_urls, record_sent_urls, extract_hrefs,
-                       paginate_telegram, update_zero_streak, resolve_proxy)
+                       paginate_telegram, update_zero_streak, resolve_proxy,
+                       is_market_relevant)
 
 LOG_FILE   = Path(__file__).parent / "logs" / "run.log"
 JSONL_FILE = Path(__file__).parent / "logs" / "run.jsonl"
@@ -105,14 +106,24 @@ WATCHLIST = ["NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AVGO",
              "PLTR", "SMCI", "ARM", "TSM", "JPM", "BRK.B", "LLY", "UNH",
              "XOM", "WMT", "COIN", "MSTR"]
 
-# 选源标准：RSS 摘要或正文至少有一个能抓到。investing.com 的条目标题很好，
-# 但摘要为空且正文被反爬拦截（实测 6 条全部零内容），只能给 Claude 一个光秃秃
-# 的标题，按 prompt 的"只写素材里出现的事实"规则等于无米之炊，故不纳入。
-# Seeking Alpha 有付费墙、Business Insider 市场源充斥律所集体诉讼通稿，同样排除。
+# (feed_url, limit, is_general)
+# is_general=True 表示这是泛财经源而非美股垂直源，条目要过 is_market_relevant 闸门。
+# 垂直源不过闸，避免误伤标题不含关键词的正当选题。
+#
+# 选源标准：RSS 摘要或正文至少有一个能抓到。已排除：
+#   · investing.com —— 标题好但摘要为空且正文被反爬拦截（实测 6 条全零内容）
+#   · Seeking Alpha —— 付费墙
+#   · Business Insider 市场源 —— 充斥律所集体诉讼通稿
+#   · Motley Fool / MarketWatch topstories —— 退休理财建议专栏，非市场新闻
+#   · Yahoo 的 feeds.finance.yahoo.com 按标的订阅接口 —— 持续返回 429
+#     （只有下面这个 finance.yahoo.com/news/rssindex 可用）
+#   · Reuters(404) / Barron's(403)
 RSS_SOURCES = [
-    ("https://www.cnbc.com/id/100003114/device/rss/rss.html", 10),  # CNBC 财经头条（宏观+市场）
-    ("https://www.cnbc.com/id/15839135/device/rss/rss.html",   8),  # CNBC 盈利/财报
-    ("https://finance.yahoo.com/news/rssindex",                8),  # Yahoo Finance（个股+分析）
+    ("https://www.cnbc.com/id/100003114/device/rss/rss.html",        10, False),  # CNBC 财经头条
+    ("https://www.cnbc.com/id/15839135/device/rss/rss.html",          8, False),  # CNBC 盈利/财报
+    ("https://finance.yahoo.com/news/rssindex",                       8, False),  # Yahoo Finance
+    ("https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",   6, False),  # MarketWatch 市场（深度，日更约 2-3 条）
+    ("https://fortune.com/feed/fortune-feeds/?id=3230629",           10, True),   # Fortune（量大，约一半与美股无关，过闸门）
 ]
 
 # ===== P2: 消息缓存（降级策略）=====
@@ -199,9 +210,14 @@ def build_news_context(entries: list) -> tuple:
         if not pub or pub < time_limit:
             drops["stale"] += 1
             continue
+        snippet = getattr(entry, "summary", "") or ""
+        # 泛财经源过美股相关性闸门，垂直源直接放行
+        if getattr(entry, "__general", False) and not is_market_relevant(title, snippet):
+            drops["off_topic"] = drops.get("off_topic", 0) + 1
+            continue
         src = getattr(entry, "__src", "?")
         kept_per_source[src] = kept_per_source.get(src, 0) + 1
-        picked.append((title, url, src, getattr(entry, "summary", "") or ""))
+        picked.append((title, url, src, snippet))
 
     def _material(item):
         title, url, src, snippet = item
@@ -288,11 +304,12 @@ def gather() -> dict:
     print("\n📡 抓取 RSS 源...", file=sys.stderr)
     entries = []
     fetched_counts: dict = {}
-    for url, limit in RSS_SOURCES:
+    for url, limit, is_general in RSS_SOURCES:
         es = fetch_rss(url, limit)
         domain = url.split("/")[2]
         for e in es:
             e["__src"] = domain
+            e["__general"] = is_general
         entries.extend(es)
         fetched_counts[domain] = fetched_counts.get(domain, 0) + len(es)
         print(f"  ✓ {len(es)} 条  {url}", file=sys.stderr)
@@ -312,7 +329,8 @@ def gather() -> dict:
 
     print(f"\n📰 共抓取 {len(entries)} 条 → 保留 {news_count} 条有效新闻", file=sys.stderr)
     print(f"   过滤明细：重复 {drops['dup']} · 已播过 {drops['already_sent']} · "
-          f"超 48h {drops['stale']} · 无正文 {drops.get('no_content', 0)}", file=sys.stderr)
+          f"超 48h {drops['stale']} · 非美股 {drops.get('off_topic', 0)} · "
+          f"无正文 {drops.get('no_content', 0)}", file=sys.stderr)
     for d, s in sorted(source_stats.items(), key=lambda kv: -kv[1]["kept"]):
         n = streak_now.get(d, 0)
         flag = f"  ⚠️ 零产（连续 {n} 天）" if s["kept"] == 0 else ""
