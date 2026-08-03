@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.shirley.us-stock-bot</string>
+
+    <!-- 本 plist 不承担调度，仅作为密钥与代理的环境变量配置源。
+         claude_report.sh 每次运行时用 PlistBuddy 直接读取本文件。 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/true</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TELEGRAM_BOT_TOKEN</key>
+        <string>YOUR_TELEGRAM_BOT_TOKEN</string>
+        <key>TELEGRAM_CHAT_ID</key>
+        <string>YOUR_TELEGRAM_CHAT_ID</string>
+        <key>HTTPS_PROXY</key>
+        <string>http://127.0.0.1:YOUR_PORT</string>
+        <key>HTTP_PROXY</key>
+        <string>http://127.0.0.1:YOUR_PORT</string>
+        <key>PATH</key>
+        <string>/Users/YOUR_USER/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
