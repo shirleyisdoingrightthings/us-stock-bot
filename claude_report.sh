@@ -1,7 +1,7 @@
 #!/bin/bash
 # claude_report.sh — 供 Claude routine 调用的 fetch/send 封装
 #
-# 用途：把 launchd plist 里的环境变量（代理、Telegram token）加载好，
+# 用途：把 launchd plist 里的环境变量（代理、飞书 webhook）加载好，
 #       再以指定模式运行 stock_report.py。密钥统一来自 LaunchAgents 权威 plist。
 # 用法：
 #   bash claude_report.sh fetch   # 抓取并把 context 打到 stdout（供 Claude 写稿）

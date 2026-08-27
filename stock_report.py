@@ -4,12 +4,12 @@
 数据源：
   · CNBC quote API: 指数 / 波动率 / 美债 / 美元 / 11 个 GICS 板块 / 重点个股（免费、无需 key）
   · RSS × 5: CNBC 财经头条 / CNBC 盈利 / Yahoo Finance / MarketWatch 市场 / Fortune
-由 Claude 写稿：① 收盘仪表盘（指数+板块+异动）② 新闻播报列表，推送 2 条 Telegram HTML 消息。
-本脚本只负责抓取与发送，不含写稿用的第三方大模型 API。
+由 Claude 写稿：① 收盘仪表盘（指数+板块+异动）② 新闻播报列表，推送 2 条飞书富文本消息。
+本脚本只负责抓取与推送，不含写稿用的第三方大模型 API。
 
 两种运行模式（--mode，均零 API 成本）：
 - fetch：抓取行情+新闻（含抓正文）→ context 打到 stdout + 写 logs/fetch_meta.json
-- send ：读取 Claude 写好的两份稿子 → 依次发送 Telegram + 写日志
+- send ：读取 Claude 写好的两份稿子 → 依次推送飞书 + 写日志
 
 关于"当天"的定义：本 bot 播报的是**最近一个已收盘的美股交易日**。北京时间
 10:06 推送时，美东时间是前一日 22:06，所以周二～周六推送的是前一交易日收盘。
@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (sanitize_html, with_retry, fetch_rss, parse_entry_date,
                        already_ran_today, fetch_article_text,
                        url_key, load_sent_urls, record_sent_urls, extract_hrefs,
-                       paginate_telegram, update_zero_streak, resolve_proxy,
+                       send_feishu, update_zero_streak, resolve_proxy,
                        is_market_relevant)
 
 LOG_FILE   = Path(__file__).parent / "logs" / "run.log"
@@ -82,8 +82,10 @@ def write_log(status: str, message: str, metrics: dict = None) -> None:
 
 
 # ===== 配置 =====
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "your_telegram_bot_token")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID",   "your_telegram_chat_id")
+# 飞书自定义机器人：webhook 地址在群「设置 → 群机器人 → 添加机器人 → 自定义机器人」
+# 里取得。若在那里勾了「签名校验」，把密钥一并放进 FEISHU_SECRET；没勾就留空。
+FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
+FEISHU_SECRET  = os.getenv("FEISHU_SECRET",  "")
 
 # CNBC 免费 quote 接口，一次调用可取全部标的，无需 API key
 CNBC_QUOTE_URL = (
@@ -127,7 +129,7 @@ RSS_SOURCES = [
 ]
 
 # ===== P2: 消息缓存（降级策略）=====
-# 代理不可用或 Telegram 发送失败时把稿件存到 pending_messages.json，避免内容丢失。
+# 飞书推送失败时把稿件存到 pending_messages.json，避免内容丢失。
 # 注意：**不做自动重发**——重发要判断"这稿子还是今天的吗"，跨天重发旧稿比丢一次
 # 更糟。当天补救由 health_check → claude_catchup 重走完整流程负责，缓存只作为
 # 人工恢复的兜底副本。
@@ -245,25 +247,14 @@ def build_news_context(entries: list) -> tuple:
     return lines, kept_per_source, drops
 
 
-# ===== 发送 Telegram =====
-@with_retry(max_retries=3, base_delay=5, exceptions=(requests.RequestException,))
-def _send_one(chunk: str) -> None:
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = SESSION.post(
-        api_url,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk,
-              "parse_mode": "HTML", "disable_web_page_preview": True},
-        timeout=30,
-    )
-    if not resp.ok:
-        raise requests.RequestException(f"Telegram 返回错误: {resp.text}")
+# ===== 推送飞书 =====
+def send_report(text: str) -> int:
+    """推送一份稿件，返回实际发出的消息条数。
 
-
-def send_telegram(text: str) -> None:
-    # sanitize 一次，在拆分前完成，避免切分点破坏标签结构；
-    # 切分 + 页码由 bot_utils.paginate_telegram 统一负责（三个 bot 共用同一实现）。
-    for chunk in paginate_telegram(sanitize_html(text)):
-        _send_one(chunk)
+    sanitize 一次、在转换前完成：HTML 只是内部中间格式，清洗保证正文里的裸
+    < > & 不会被标签解析吃掉。转 post、按 20KB 分页、失败重试都由
+    bot_utils.send_feishu 统一负责（三个 bot 共用同一实现）。"""
+    return send_feishu(sanitize_html(text), FEISHU_WEBHOOK, FEISHU_SECRET)
 
 
 # ===== 代理预检 + 端口自愈 =====
@@ -478,18 +469,15 @@ def run_send() -> int:
         write_log("FAIL", "稿子文件为空（消息①或②）")
         return 1
 
-    if not _proxy_ok():
-        save_pending([market, news])
-        write_log("WARN", f"代理不可用（{_PROXY}），两稿已缓存未发送")
-        return 0
-
+    # 不再做代理预检：飞书直连可达，推送阶段本来就不需要翻墙代理。
+    # （Telegram 时代代理一挂当天就整个不播，现在只有抓取阶段依赖它。）
     save_pending([market, news])
-    print("📨 发送到 Telegram...", file=sys.stderr)
-    send_telegram(market)
+    print("📨 推送到飞书...", file=sys.stderr)
+    send_report(market)
     save_pending([news])          # 消息①已发：更新缓存，防止重跑时重复推送
-    send_telegram(news)
+    send_report(news)
     CACHE_FILE.unlink(missing_ok=True)
-    print("  ✓ 发送成功", file=sys.stderr)
+    print("  ✓ 推送成功", file=sys.stderr)
 
     hrefs = extract_hrefs(market) + extract_hrefs(news)
     if hrefs:
@@ -512,7 +500,7 @@ def run_send() -> int:
     duration = round(time.time() - t0, 1)
     write_log(
         "OK",
-        f"Claude写稿 → {meta.get('log_summary', '')} → Telegram发送成功",
+        f"Claude写稿 → {meta.get('log_summary', '')} → 飞书推送成功",
         metrics={**meta.get("metrics", {}), "ai_calls": 0, "source": "claude",
                  "duration_s": duration},
     )

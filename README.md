@@ -1,6 +1,6 @@
 # US Stock Bot
 
-每天早上由 Claude 自动写稿：拉取四大指数、VIX、美债与美元、11 个 GICS 板块、28 支重点个股的收盘数据，加上三家财经媒体的当日要闻，生成一份《美股收盘》+《美股要闻》，两条消息推送到 Telegram。
+每天早上由 Claude 自动写稿：拉取四大指数、VIX、美债与美元、11 个 GICS 板块、28 支重点个股的收盘数据，加上三家财经媒体的当日要闻，生成一份《美股收盘》+《美股要闻》，两条消息推送到飞书。
 
 内容是**最近一个已收盘的美股交易日**——北京时间早上推送时，美股昨夜的行情已完全落定，不需要熬夜看盘。
 
@@ -37,7 +37,7 @@
 
 - **速览**：固定 5 条，每条带星级 + 至少一个具体数字，与正文前 5 条一一对应
 - **收盘仪表盘**：指数 + 宏观三件套 + 板块轮动 + 个股异动，每条都给资金逻辑
-- **超长自动分页**：超过 Telegram 单条 4096 上限时按段落切分，每条顶部标 `（n/N）` 页码
+- **超长自动分页**：超过飞书 webhook 单条 20KB 请求体上限时按段落切分，每条顶部标 `（n/N）` 页码
 
 **稳定性 — 出了问题自己修**
 
@@ -75,7 +75,7 @@ RSS × 3（CNBC 头条 / CNBC 财报 / Yahoo Finance）               ├──�
                                                                      │  超 4096 → 分页 + (n/N) 页码
                                                                      │  发送成功 → 归档链接 + 记录场次
                                                                      ▼
-                                                          Telegram（2 条 HTML 消息）
+                                                          飞书（2 条卡片消息）
 
 【自动化调度】
 10:00  Claude 定时任务（唯一写稿入口）
@@ -104,8 +104,8 @@ RSS × 3（CNBC 头条 / CNBC 财报 / Yahoo Finance）               ├──�
 
 | 变量 | 说明 |
 |------|------|
-| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token |
-| `TELEGRAM_CHAT_ID` | 目标 Chat ID |
+| `FEISHU_WEBHOOK` | 飞书自定义机器人 webhook 地址 |
+| `FEISHU_SECRET` | 机器人签名密钥（未开签名校验则留空） |
 | `HTTPS_PROXY` / `HTTP_PROXY` | 本地代理地址（127.0.0.1:YOUR_PORT） |
 
 > 该 plist 不承担任何调度职责，仅作为环境变量配置源。
@@ -119,7 +119,7 @@ RSS × 3（CNBC 头条 / CNBC 财报 / Yahoo Finance）               ├──�
 cd ~/Desktop/bots/us\ stock\ bot
 bash claude_report.sh fetch     # 抓取行情+新闻，把写稿素材打到 stdout
 # （由 Claude 依两个 prompt 写稿并存入 logs/report_market.txt 与 report_news.txt）
-bash claude_report.sh send      # 读取两稿，清洗 HTML 后推送 Telegram
+bash claude_report.sh send      # 读取两稿，清洗 HTML 后推送飞书
 ```
 
 **验证调度状态**
