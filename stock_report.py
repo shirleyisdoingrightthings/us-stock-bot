@@ -38,7 +38,9 @@ from bot_utils import (sanitize_html, with_retry, fetch_rss, parse_entry_date,
                        already_ran_today, fetch_article_text,
                        url_key, load_sent_urls, record_sent_urls, extract_hrefs,
                        send_feishu, update_zero_streak, resolve_proxy,
-                       is_market_relevant)
+                       is_market_relevant,
+                       make_logger, make_pending_saver, proxy_ok,
+                       emit_fetch_output)
 
 LOG_FILE   = Path(__file__).parent / "logs" / "run.log"
 JSONL_FILE = Path(__file__).parent / "logs" / "run.jsonl"
@@ -50,6 +52,9 @@ DRAFT_MARKET = Path(__file__).parent / "logs" / "report_market.txt"  # 消息①
 DRAFT_NEWS   = Path(__file__).parent / "logs" / "report_news.txt"    # 消息②新闻播报
 # fetch 模式写出、send 模式读回的边车：承载 OK 日志摘要与 health_check 所需 metrics
 FETCH_META   = Path(__file__).parent / "logs" / "fetch_meta.json"
+# fetch 抓来的完整 stdout（marker + context）落盘一份：调用方截断、进程中断、
+# 或写稿失败要重来时，不必再打一遍外部 API。每次 fetch 覆盖写，只留最近一次。
+LAST_CONTEXT = Path(__file__).parent / "logs" / "last_context.txt"
 # 跨天去重档案：send 成功后记录稿件里实际用到的链接，fetch 时据此排除
 SENT_URLS    = Path(__file__).parent / "logs" / "sent_urls.json"
 # RSS 源连续零产计数（fetch 阶段唯一写入，health_check 只读）
@@ -68,17 +73,9 @@ if _PROXY:
     os.environ.setdefault("HTTPS_PROXY", _PROXY)
 
 
-# ===== P1: 结构化日志 =====
-def write_log(status: str, message: str, metrics: dict = None) -> None:
-    ts   = datetime.now().strftime("%Y-%m-%d %H:%M")
-    line = f"{ts}  [{status}]  {message}\n"
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line)
-    print(line, end="")
-    if metrics:
-        record = {"ts": ts, "status": status, "msg": message, **metrics}
-        with open(JSONL_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+# ===== P1: 结构化日志（实现见 shared/bot_utils.make_logger）=====
+write_log = make_logger(LOG_FILE, JSONL_FILE)
+
 
 
 # ===== 配置 =====
@@ -133,9 +130,8 @@ RSS_SOURCES = [
 # 注意：**不做自动重发**——重发要判断"这稿子还是今天的吗"，跨天重发旧稿比丢一次
 # 更糟。当天补救由 health_check → claude_catchup 重走完整流程负责，缓存只作为
 # 人工恢复的兜底副本。
-def save_pending(messages: list) -> None:
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"ts": datetime.now().isoformat(), "messages": messages}, f, ensure_ascii=False)
+save_pending = make_pending_saver(CACHE_FILE)
+
 
 
 # ===== 行情抓取 =====
@@ -259,19 +255,11 @@ def send_report(text: str) -> int:
 
 # ===== 代理预检 + 端口自愈 =====
 def _proxy_ok() -> bool:
-    """配置端口不通时探测候选端口（见 bot_utils.PROXY_CANDIDATES），命中则就地
-    切换本进程的 SESSION 与环境变量。无代理配置直接放行（视为直连）。"""
+    """代理预检 + 端口自愈，实现见 shared/bot_utils.proxy_ok。"""
     global _PROXY
-    resolved, switched = resolve_proxy(_PROXY)
-    if resolved is None:
-        return not _PROXY
-    if switched:
-        _PROXY = resolved
-        SESSION.proxies = {"http": resolved, "https": resolved}
-        # feedparser 走 urllib，必须同步环境变量（用赋值而非 setdefault）
-        os.environ["HTTP_PROXY"] = resolved
-        os.environ["HTTPS_PROXY"] = resolved
-    return True
+    ok, _PROXY = proxy_ok(_PROXY, SESSION)
+    return ok
+
 
 
 # ===== 汇总抓取 =====
@@ -435,20 +423,26 @@ def run_fetch() -> int:
         encoding="utf-8",
     )
 
-    print("=== FETCH_OK ===")
-    print(f"今天日期：{data['today']}")
-    print(f"收盘交易日：{sess}")
-    print(f"保留 {data['news_count']} 条有效新闻（共抓取 {len(data['entries'])} 条）")
+    # 先攒成列表再一次性交给 emit_fetch_output，顺带落盘 logs/last_context.txt。
+    out = ["=== FETCH_OK ===",
+           f"今天日期：{data['today']}",
+           f"收盘交易日：{sess}",
+           f"保留 {data['news_count']} 条有效新闻（共抓取 {len(data['entries'])} 条）"]
+    # 上次播的是哪个场次。本 bot 按"最近一个已收盘交易日"取数，中间漏跑几天时会
+    # 直接跳到最新场次，被跳过的那些收盘就永远不会播——2026-08-27 的收盘就是这么
+    # 丢的（08-27 播的是 08-26，之后两天没跑，08-30 直接播 08-28）。两个日期并排
+    # 打出来，写稿方一眼能看出中间是否缺了场次。
+    if last and last != sess:
+        out.append(f"上次播报的收盘交易日：{last}")
     if data["zero_sources"]:
-        print(f"零产源：{', '.join(data['zero_sources'])}")
+        out.append(f"零产源：{', '.join(data['zero_sources'])}")
     if data["stale_sources"]:
-        print("=== SOURCE_ALERT ===")
+        out.append("=== SOURCE_ALERT ===")
         for d, n in data["stale_sources"].items():
-            print(f"{d} 已连续 {n} 天零产，建议从 RSS_SOURCES 移除或更换")
-        print("=== SOURCE_ALERT_END ===")
-    print("=== CONTEXT_BEGIN ===")
-    print(build_context(data))
-    print("=== CONTEXT_END ===")
+            out.append(f"{d} 已连续 {n} 天零产，建议从 RSS_SOURCES 移除或更换")
+        out.append("=== SOURCE_ALERT_END ===")
+    out += ["=== CONTEXT_BEGIN ===", build_context(data), "=== CONTEXT_END ==="]
+    emit_fetch_output(out, LAST_CONTEXT)
     return 0
 
 
