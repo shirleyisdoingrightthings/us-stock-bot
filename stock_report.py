@@ -37,8 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (sanitize_html, with_retry, fetch_rss, parse_entry_date,
                        already_ran_today, fetch_article_text,
                        url_key, load_sent_urls, record_sent_urls, extract_hrefs,
-                       send_feishu, update_zero_streak, resolve_proxy,
-                       is_market_relevant,
+                       send_feishu, update_zero_streak, is_market_relevant,
                        make_logger, make_pending_saver, proxy_ok,
                        emit_fetch_output)
 
