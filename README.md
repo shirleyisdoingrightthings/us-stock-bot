@@ -19,7 +19,7 @@
 | 宏观 | VIX / 10 年期美债收益率 / 美元指数 |
 | 板块 | 11 个 GICS 板块（SPDR 行业 ETF 代理），按涨跌幅排序 |
 | 个股 | 28 支大市值 + 高关注度标的，自动挑两端异动 |
-| 新闻 | CNBC 财经头条 · CNBC 盈利/财报 · Yahoo Finance |
+| 新闻 | CNBC 财经头条 · CNBC 盈利/财报 · MarketWatch 市场 · Fortune |
 
 行情走 CNBC 免费 quote 接口，一次调用取回全部 46 个标的，无需 API key。
 
@@ -45,7 +45,7 @@
 
 ```
 CNBC quote API（指数/VIX/美债/美元/11 板块/28 个股）─┐
-RSS × 3（CNBC 头条 / CNBC 财报 / Yahoo Finance）    ├─▶ stock_report.py --mode fetch
+RSS × 4（CNBC 头条 / 财报 / MarketWatch / Fortune） ├─▶ stock_report.py --mode fetch
                                                     ┘     │  ├─ URL 去重 + 跨天去重
                                                           │  ├─ 48h 时间窗
                                                           │  ├─ 内容闸门（丢弃无正文条目）

@@ -3,7 +3,7 @@
 美股收盘日报
 数据源：
   · CNBC quote API: 指数 / 波动率 / 美债 / 美元 / 11 个 GICS 板块 / 重点个股（免费、无需 key）
-  · RSS × 5: CNBC 财经头条 / CNBC 盈利 / Yahoo Finance / MarketWatch 市场 / Fortune
+  · RSS × 4: CNBC 财经头条 / CNBC 盈利 / MarketWatch 市场 / Fortune
 由 Claude 写稿：① 收盘仪表盘（指数+板块+异动）② 新闻播报列表，推送 2 条飞书富文本消息。
 本脚本只负责抓取与推送，不含写稿用的第三方大模型 API。
 
@@ -113,8 +113,8 @@ WATCHLIST = ["NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AVGO",
 #   · Seeking Alpha —— 付费墙
 #   · Business Insider 市场源 —— 充斥律所集体诉讼通稿
 #   · Motley Fool / MarketWatch topstories —— 退休理财建议专栏，非市场新闻
-#   · Yahoo 的 feeds.finance.yahoo.com 按标的订阅接口 —— 持续返回 429
-#     （只有下面这个 finance.yahoo.com/news/rssindex 可用）
+#   · Yahoo 全部接口 —— feeds.finance.yahoo.com 按标的订阅持续返回 429；
+#     news/rssindex 虽可抓，但 2026-09-04 已因留存率最低撤除（见下），本源不再使用
 #   · Reuters(404) / Barron's(403)
 RSS_SOURCES = [
     ("https://www.cnbc.com/id/100003114/device/rss/rss.html",        10, False),  # CNBC 财经头条
@@ -173,7 +173,7 @@ _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 #   其中 TNX 明确回 "not available with your plan" —— 指数是付费功能。
 #   symbol_search 反查 "S&P 500"/"VIX" 返回的也全是 ETF、没有指数本体。
 # 所以本兜底只能出「有板块、无指数」的降级日报，比整个不发强，但不是完整替代。
-# 指数那部分待 Yahoo v8 chart 解封后另补（见 README 的待办）。
+# 指数那部分已于 2026-09-04 晚由 FMP 补上并实测通过（见下方 FMP 兜底）。
 #
 # ⚠️ 不要用 SPY/QQQ 冒充标普/纳指：百分比接近，但日报印的是指数点位，
 # 塞 ETF 价格进去就是错的。
@@ -226,7 +226,6 @@ FMP_PACING_S = 0.5
 
 FMP_CROSSCHECK = [".SPX", ".IXIC"]
 FMP_CROSSCHECK_TOLERANCE = 0.005      # 相对偏差超过 0.5% 就告警（不阻断发稿）
-YAHOO_CROSSCHECK = False              # Yahoo 已永久排除，常量保留仅为标明"曾评估过"
 
 
 def fetch_quotes_fmp(cnbc_symbols: list) -> dict:

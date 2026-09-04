@@ -128,18 +128,20 @@ FMP 的三个接口坑：
 > 两条技术事实备查：v8 chart **不支持批量**（一符号一请求，这是它无法取代 CNBC 的根本原因）；
 > `v7/finance/quote` 已需 crumb 认证（401），不可用。
 
-### 新闻：RSS × 3
+### 新闻：RSS × 4
 
 | 源 | 额度 | 定位 |
 |---|---|---|
 | CNBC 财经头条 | 10 | 宏观 + 市场 |
 | CNBC 盈利/财报 | 8 | 财报专线 |
-| Yahoo Finance | 8 | 个股 + 分析 |
+| MarketWatch 市场 | 6 | 深度，日更约 2-3 条 |
+| Fortune | 10 | 量大，约一半与美股无关，过闸门 |
 
 **选源标准：RSS 摘要或正文至少有一个能抓到。** 已排除：
 - `investing.com` —— 标题很好但摘要为空且正文被反爬拦截（实测 6 条全零内容）
 - Seeking Alpha —— 付费墙
 - Business Insider 市场源 —— 充斥律所集体诉讼通稿
+- Yahoo Finance —— 按标的订阅接口持续 429；`news/rssindex` 留存率最低（9-03 fetched=8 / kept=2）且与 CNBC 高度重叠，2026-09-04 撤除，不要再加回来
 
 ---
 
