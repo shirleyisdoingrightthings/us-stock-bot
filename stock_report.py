@@ -119,7 +119,9 @@ WATCHLIST = ["NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AVGO",
 RSS_SOURCES = [
     ("https://www.cnbc.com/id/100003114/device/rss/rss.html",        10, False),  # CNBC 财经头条
     ("https://www.cnbc.com/id/15839135/device/rss/rss.html",          8, False),  # CNBC 盈利/财报
-    ("https://finance.yahoo.com/news/rssindex",                       8, False),  # Yahoo Finance
+    # 2026-09-04：撤掉 Yahoo Finance（finance.yahoo.com/news/rssindex）。
+    # 9-03 那轮 fetched=8 / kept=2，是五个源里留存率最低的；内容以聚合转载为主，
+    # 与 CNBC 两个源高度重叠，占着抓取额度却很少进正文。不要再加回来。
     ("https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",   6, False),  # MarketWatch 市场（深度，日更约 2-3 条）
     ("https://fortune.com/feed/fortune-feeds/?id=3230629",           10, True),   # Fortune（量大，约一半与美股无关，过闸门）
 ]
@@ -161,6 +163,218 @@ _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 
+# ===== 行情兜底源：Twelve Data（2026-09-04 加）=====
+# 加它的理由：在此之前 18 个标的 100% 来自 CNBC 那一个接口，它一挂就是
+# SKIP_NO_QUOTES —— 两条消息都不发，不只是行情那条。这是全 bot 唯一的单点。
+#
+# ⚠️ **免费档只覆盖板块 ETF，不含指数**。2026-09-04 用真 key 实测：
+#   11 个板块 ETF（XLK/XLC/...）  ✓ 正常
+#   4 个指数 + VIX + 美债 + 美元指数  ✗ 全部 symbol not found，
+#   其中 TNX 明确回 "not available with your plan" —— 指数是付费功能。
+#   symbol_search 反查 "S&P 500"/"VIX" 返回的也全是 ETF、没有指数本体。
+# 所以本兜底只能出「有板块、无指数」的降级日报，比整个不发强，但不是完整替代。
+# 指数那部分待 Yahoo v8 chart 解封后另补（见 README 的待办）。
+#
+# ⚠️ 不要用 SPY/QQQ 冒充标普/纳指：百分比接近，但日报印的是指数点位，
+# 塞 ETF 价格进去就是错的。
+#
+# 免费档限流：8 credit/分钟，按 symbol 计。11 个 ETF 必须分两批（8+3），
+# 中间等一分钟——所以兜底路径最慢要跑 1 分多钟，只在 CNBC 已经失败时才走。
+# ===== 行情兜底源之二：FMP（2026-09-04 加）=====
+# 补的是 Twelve Data 拿不到的那半边：指数与宏观。两家的免费档限制方式完全不同——
+#   Twelve Data 按**品类**限制：ETF 和股票开放，指数收费。
+#   FMP 按**符号白名单**限制：不分品类，挑着给。
+# 2026-09-04 用真 key 逐个实测的结果（别再重新试）：
+#   ✓ ^GSPC ^IXIC ^DJI ^RUT ^VIX          —— 4 指数 + VIX 全可取，
+#                                            数值与 CNBC 当日逐位吻合（7747.71 / 26584.06）
+#   ✓ 10 年期美债                          —— quote 端点取不到（^TNX/TNX/US10Y 全 402），
+#                                            但 /stable/treasury-rates 免费可用，
+#                                            返回完整收益率曲线（year10 等，63 天历史）
+#   ✗ 美元指数                             —— DX-Y.NYB / ^DXY / DXY / USDX 四种写法全 402
+#   ✗ 11 个板块 ETF                        —— XLK/XLC/XLY/XLRE/XLU 抽样全 402，一个都取不到
+#                                            （所以 Twelve Data 不能删，板块只有它能兜）
+#   ✓ 18/28 只个股                         —— 白名单，取不到的是 AVGO ORCL CRM MU QCOM
+#                                            SMCI ARM BRK.B LLY MSTR
+#
+# ⚠️ 三个必须知道的接口事实：
+#   1. **v3 端点已废弃**：/api/v3/quote/ 返回 403 "Legacy Endpoint"，
+#      仅 2025-08-31 前订阅的老用户可用。当前端点是 /stable/quote?symbol=X。
+#      网上多数教程还在教 v3 写法，会直接撞墙。
+#   2. **批量是付费的**：symbol=A,B,C 返回 402，只能一符号一请求。
+#      但免费档 250 calls/day，我们一天最多 8 次，占 3%，无压力。
+#   3. treasury-rates 的最新日期可能比收盘场次晚一天（美债数据本身滞后），
+#      取值时要按日期挑最接近的那条，不能默认第一条就是当天。
+FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+FMP_QUOTE_URL = "https://financialmodelingprep.com/stable/quote"
+FMP_TREASURY_URL = "https://financialmodelingprep.com/stable/treasury-rates"
+# CNBC 符号 → FMP 符号。美元指数 .DXY 不在这里：免费档取不到，只能标记缺失。
+FMP_SYMBOL_MAP = {".SPX": "^GSPC", ".IXIC": "^IXIC", ".DJI": "^DJI",
+                  ".RUT": "^RUT", ".VIX": "^VIX"}
+# 交叉验证只查这两个：实测它俩与 CNBC 逐位吻合，适合做基准。
+# VIX 不纳入——两边快照时点不同，实测 14.18 vs 14.32 差约 1%，
+# 按 0.5% 阈值会天天误报。
+# FMP 免费档能取到的个股白名单（2026-09-04 对 WATCHLIST 全部 28 只逐个实测）。
+# 取不到的 10 只：AVGO ORCL CRM MU QCOM SMCI ARM BRK.B LLY MSTR —— 402 premium，
+# 没有规律可循，就是白名单挑着给。**改 WATCHLIST 时记得同步实测这个列表**，
+# 加进来没实测过的符号只会在兜底时白白消耗配额并报 402。
+FMP_STOCK_OK = ["NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AMD",
+                "NFLX", "ADBE", "INTC", "PLTR", "TSM", "JPM", "UNH", "XOM",
+                "WMT", "COIN"]
+# 逐个请求之间的间隔。免费档没有公布每分钟上限，给 0.5s 是保守值，
+# 兜底路径取 18 只个股约需 9 秒——只在 CNBC 已经挂掉时才走这条路。
+FMP_PACING_S = 0.5
+
+FMP_CROSSCHECK = [".SPX", ".IXIC"]
+FMP_CROSSCHECK_TOLERANCE = 0.005      # 相对偏差超过 0.5% 就告警（不阻断发稿）
+YAHOO_CROSSCHECK = False              # Yahoo 已永久排除，常量保留仅为标明"曾评估过"
+
+
+def fetch_quotes_fmp(cnbc_symbols: list) -> dict:
+    """兜底行情源之二。返回与 fetch_quotes 同形的 {cnbc_symbol: quote_dict}。
+
+    只处理 FMP_SYMBOL_MAP 里有映射的符号（4 指数 + VIX）；
+    10 年期美债由 fetch_treasury_10y 单独取，走的是完全不同的端点。
+    任何一个符号失败只丢那一个，其余照常返回。
+    """
+    if not FMP_API_KEY:
+        print("[WARN] 未配置 FMP_API_KEY，跳过 FMP 兜底", file=sys.stderr)
+        return {}
+    out = {}
+    for cnbc in cnbc_symbols:
+        # 指数/宏观走映射表；个股符号两边同名，但必须在实测过的白名单里
+        fmp_sym = FMP_SYMBOL_MAP.get(cnbc)
+        if not fmp_sym and cnbc in FMP_STOCK_OK:
+            fmp_sym = cnbc
+        if not fmp_sym:
+            continue
+        try:
+            resp = SESSION.get(FMP_QUOTE_URL,
+                               params={"symbol": fmp_sym, "apikey": FMP_API_KEY},
+                               headers={"User-Agent": _UA}, timeout=25)
+            resp.raise_for_status()
+            rows = resp.json()
+        except Exception as exc:
+            print(f"[WARN] FMP {fmp_sym} 失败: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(rows, list) or not rows:
+            continue
+        q = rows[0]
+        price, pct = q.get("price"), q.get("changePercentage")
+        if price is None:
+            continue
+        out[cnbc] = {
+            "symbol": cnbc,
+            "last": _td_fmt_price(price),
+            "change_pct": _td_fmt_pct(pct),
+            # FMP 不给收盘时间戳，交由调用方用别的标的推 session
+            "last_time": "",
+        }
+        time.sleep(FMP_PACING_S)
+    return out
+
+
+def fetch_treasury_10y(session_day: str = "") -> dict:
+    """取 10 年期美债收益率。返回 {"US10Y": quote_dict} 或 {}。
+
+    走 /stable/treasury-rates（免费可用），返回的是收益率曲线的历史序列。
+    ⚠️ 最新一条可能比收盘场次晚一天，所以按 session_day 挑「不晚于该日的最近一条」；
+    没给 session_day 就取最新一条。
+    """
+    if not FMP_API_KEY:
+        return {}
+    try:
+        resp = SESSION.get(FMP_TREASURY_URL, params={"apikey": FMP_API_KEY},
+                           headers={"User-Agent": _UA}, timeout=25)
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception as exc:
+        print(f"[WARN] FMP 国债收益率失败: {exc}", file=sys.stderr)
+        return {}
+    if not isinstance(rows, list) or not rows:
+        return {}
+    pick = None
+    for row in rows:                       # 接口按日期倒序返回
+        if not session_day or (row.get("date") or "") <= session_day:
+            pick = row
+            break
+    pick = pick or rows[0]
+    y10 = pick.get("year10")
+    if y10 is None:
+        return {}
+    note = "" if pick.get("date") == session_day else f"（{pick.get('date')}）"
+    return {"US10Y": {"symbol": "US10Y", "last": f"{y10}%{note}",
+                      "change_pct": "", "last_time": ""}}
+
+
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+TWELVEDATA_URL = "https://api.twelvedata.com/quote"
+_TD_BATCH = 8
+_TD_WAIT_S = 62
+
+
+def _td_fmt_price(v) -> str:
+    """"185.97000" → "185.97"（带千分位，对齐 CNBC 的 last 字段格式）。"""
+    try:
+        return f"{float(v):,.2f}"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _td_fmt_pct(v) -> str:
+    """"1.29085" → "+1.29%"（对齐 CNBC 的 change_pct 格式）。"""
+    try:
+        return f"{float(v):+.2f}%"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def fetch_quotes_twelvedata(symbols: list) -> dict:
+    """兜底行情源。返回与 fetch_quotes 同形的 {symbol: quote_dict}。
+
+    输出字段刻意对齐 CNBC（last / change_pct / last_time），
+    这样 fmt_quote 和 session_date 都不用改。
+    任何一批失败只丢那一批，已拿到的照常返回。
+    """
+    if not TWELVEDATA_API_KEY:
+        print("[WARN] 未配置 TWELVEDATA_API_KEY，跳过兜底行情源", file=sys.stderr)
+        return {}
+    out = {}
+    batches = [symbols[i:i + _TD_BATCH] for i in range(0, len(symbols), _TD_BATCH)]
+    for n, batch in enumerate(batches):
+        if n:
+            print(f"  … 免费档限流 {_TD_BATCH} credit/分钟，等待 {_TD_WAIT_S}s",
+                  file=sys.stderr)
+            time.sleep(_TD_WAIT_S)
+        try:
+            resp = SESSION.get(TWELVEDATA_URL,
+                               params={"symbol": ",".join(batch),
+                                       "apikey": TWELVEDATA_API_KEY},
+                               timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            print(f"[WARN] Twelve Data 第 {n + 1} 批失败: {exc}", file=sys.stderr)
+            continue
+        # 单标的时返回对象本身，多标的时返回 {symbol: obj}
+        items = data if len(batch) > 1 else {batch[0]: data}
+        if isinstance(items, dict) and items.get("status") == "error":
+            print(f"[WARN] Twelve Data 第 {n + 1} 批报错: "
+                  f"{str(items.get('message'))[:120]}", file=sys.stderr)
+            continue
+        for sym, q in items.items():
+            if not isinstance(q, dict) or not q.get("close"):
+                continue
+            day = q.get("datetime", "")
+            out[sym] = {
+                "symbol": sym,
+                "last": _td_fmt_price(q.get("close")),
+                "change_pct": _td_fmt_pct(q.get("percent_change")),
+                # session_date 只取 T 之前那段，补个收盘时刻即可
+                "last_time": f"{day}T16:00:00" if day else "",
+            }
+    return out
+
+
 def fmt_quote(q: dict) -> str:
     """格式化为「7,489.72 (+0.70%)」。"""
     if not q:
@@ -169,10 +383,21 @@ def fmt_quote(q: dict) -> str:
 
 
 def session_date(quotes: dict) -> str:
-    """从标普的报价里取最近收盘交易日（YYYY-MM-DD）。"""
+    """取最近收盘交易日（YYYY-MM-DD）。优先用标普，缺失时退回任意有时间的标的。
+
+    退回分支是给 Twelve Data 兜底路径用的：那条路拿不到指数，只有板块 ETF，
+    但 ETF 和指数在同一个交易时段收盘，日期一致。session 是本 bot 的幂等键
+    （同一场次只播一次），推不出来的话整个流程就断了。
+    """
     q = quotes.get(".SPX", {})
     t = q.get("last_time", "") or ""
-    return t.split("T")[0] if t else ""
+    if t:
+        return t.split("T")[0]
+    for qq in quotes.values():
+        t = (qq or {}).get("last_time", "") or ""
+        if t:
+            return t.split("T")[0]
+    return ""
 
 
 # ===== 新闻抓取 =====
@@ -266,18 +491,82 @@ def gather() -> dict:
     print("📈 抓取行情...", file=sys.stderr)
     all_syms = ([s for s, _ in INDICES] + [s for s, _ in MACRO] +
                 [s for s, _ in SECTORS] + WATCHLIST)
+    quotes, degraded = {}, False
     try:
         quotes = fetch_quotes(all_syms)
     except Exception as e:
-        print(f"[WARN] 行情抓取失败: {e}", file=sys.stderr)
-        return None
+        print(f"[WARN] CNBC 行情抓取失败: {e}", file=sys.stderr)
+
+    # CNBC 挂了（或返回里没有标普）→ 走 Twelve Data 兜底。
+    # 兜底只覆盖板块 ETF，指数/宏观拿不到（免费档不含指数，见上面的说明），
+    # 所以这是**降级出稿**：有板块轮动、没有指数点位，比 SKIP_NO_QUOTES
+    # 整个不发要好。degraded 会一路传到 context，让写稿方明确交代。
     if not quotes.get(".SPX"):
-        print("[WARN] 标普指数缺失，视为行情抓取失败", file=sys.stderr)
+        # 两家兜底分工互补，合起来覆盖「指数 + 宏观 + 板块」：
+        #   FMP          → 4 指数 + VIX（+ 国债走另一个端点）；板块 ETF 它一个都取不到
+        #   Twelve Data  → 11 个板块 ETF；指数它一个都取不到
+        # 仍然补不上的只有美元指数和个股异动榜，由 build_context 按实际缺项标注。
+        print("[WARN] CNBC 无标普数据，启用兜底源（FMP 指数 + Twelve Data 板块）",
+              file=sys.stderr)
+        # 指数/宏观 + 白名单内的个股一起要（个股用于异动榜，缺了榜就短一截）
+        fb1 = fetch_quotes_fmp([s for s, _ in INDICES] + [s for s, _ in MACRO]
+                               + [s for s in WATCHLIST if s in FMP_STOCK_OK])
+        if fb1:
+            quotes.update({k: v for k, v in fb1.items() if k not in quotes})
+            n_idx = sum(1 for k in fb1 if k in FMP_SYMBOL_MAP)
+            print(f"  ✓ FMP 取到 {n_idx} 个指数/宏观 + {len(fb1) - n_idx} 只个股",
+                  file=sys.stderr)
+        fb2 = fetch_quotes_twelvedata([s for s, _ in SECTORS])
+        if fb2:
+            quotes.update({k: v for k, v in fb2.items() if k not in quotes})
+            print(f"  ✓ Twelve Data 取到 {len(fb2)} 个板块 ETF", file=sys.stderr)
+        degraded = bool(fb1 or fb2)
+
+    if not quotes:
+        print("[WARN] 主源与兜底源均无数据，视为行情抓取失败", file=sys.stderr)
         return None
-    print(f"  ✓ {len(quotes)} 个标的", file=sys.stderr)
+    print(f"  ✓ {len(quotes)} 个标的"
+          f"{'（降级：数据来自兜底源）' if degraded else ''}", file=sys.stderr)
 
     sess = session_date(quotes)
-    print(f"  最近收盘交易日: {sess}", file=sys.stderr)
+    if not sess:
+        print("[WARN] 推不出收盘交易日，视为行情抓取失败", file=sys.stderr)
+        return None
+    print(f"  最近收盘交易日: {sess}"
+          f"{'（由兜底源推出）' if degraded else ''}", file=sys.stderr)
+
+    # 国债要等 session 定下来才能取（要挑不晚于收盘日的那条），所以放在这里
+    if degraded and not quotes.get("US10Y"):
+        t10 = fetch_treasury_10y(sess)
+        if t10:
+            quotes.update(t10)
+            print(f"  ✓ FMP 补到 10 年期美债 {t10['US10Y']['last']}", file=sys.stderr)
+
+    # 交叉验证：CNBC 正常时用 FMP 核对两个基准指数。
+    # 这是监控手段不是准入门槛——偏差只告警，绝不阻止发稿；
+    # FMP 那侧失败就静默跳过，不制造噪音、不重试。
+    crosscheck_note = ""
+    if not degraded and FMP_API_KEY:
+        try:
+            ref = fetch_quotes_fmp(FMP_CROSSCHECK)
+            for sym in FMP_CROSSCHECK:
+                a, b = quotes.get(sym, {}).get("last"), ref.get(sym, {}).get("last")
+                if not (a and b):
+                    continue
+                fa, fb_ = _num(a), _num(b)
+                if not (fa and fb_):
+                    continue
+                dev = abs(fa - fb_) / fb_
+                if dev > FMP_CROSSCHECK_TOLERANCE:
+                    msg = (f"{sym} 交叉验证偏差 {dev:.2%}："
+                           f"CNBC={a} vs FMP={b}")
+                    write_log("WARN", msg)
+                    crosscheck_note += f"⚠️ {msg}\n"
+                    print(f"  ⚠️ {msg}", file=sys.stderr)
+                else:
+                    print(f"  ✓ {sym} 交叉验证通过（偏差 {dev:.3%}）", file=sys.stderr)
+        except Exception as exc:
+            print(f"  … 交叉验证跳过: {exc}", file=sys.stderr)
 
     print("\n📡 抓取 RSS 源...", file=sys.stderr)
     entries = []
@@ -314,7 +603,9 @@ def gather() -> dict:
         flag = f"  ⚠️ 零产（连续 {n} 天）" if s["kept"] == 0 else ""
         print(f"   {d:26s} 抓{s['fetched']:>2} → 留{s['kept']:>2}{flag}", file=sys.stderr)
 
-    return {"quotes": quotes, "session": sess, "news_lines": news_lines,
+    return {"quotes": quotes, "session": sess, "degraded": degraded,
+            "crosscheck_note": crosscheck_note,
+            "news_lines": news_lines,
             "news_count": news_count, "entries": entries,
             "zero_sources": zero_sources, "source_stats": source_stats,
             "stale_sources": stale_sources,
@@ -324,6 +615,48 @@ def gather() -> dict:
 def build_context(data: dict) -> str:
     """拼出交给 Claude 写稿的完整 context。"""
     q = data["quotes"]
+    # 降级模式：CNBC 挂了、走的 Twelve Data 兜底，只有板块 ETF 没有指数。
+    # 必须显式告诉写稿方，否则它会照着模板去写「标普收于未知」这种句子。
+    # 降级告示按**实际缺了什么**分级，而不是一律说"无指数"。
+    # 两家兜底互补（FMP 给指数/宏观、Twelve Data 给板块），多数情况下骨架是全的，
+    # 只缺美元指数和个股异动榜——那种程度不该让写稿方以为大盘数据没了。
+    degraded_note = ""
+    if data.get("degraded"):
+        have_idx = [n for sym, n in INDICES if q.get(sym)]
+        miss_idx = [n for sym, n in INDICES if not q.get(sym)]
+        miss_mac = [n for sym, n in MACRO if not q.get(sym)]
+        miss_sec = [n for sym, n in SECTORS if not q.get(sym)]
+        miss_stk = [sym for sym in WATCHLIST if not q.get(sym)]
+
+        lines = ["=== DEGRADED ===",
+                 "⚠️ 本次 CNBC 行情源不可用，数据来自兜底源（FMP 指数/宏观 + Twelve Data 板块）。"]
+        if miss_idx:
+            lines.append(f"**缺失的指数**：{'、'.join(miss_idx)}")
+        if miss_mac:
+            lines.append(f"**缺失的宏观指标**：{'、'.join(miss_mac)}")
+        if miss_sec:
+            lines.append(f"**缺失的板块**：{'、'.join(miss_sec)}")
+        if miss_stk:
+            lines.append(f"**个股异动榜缺失 {len(miss_stk)} 只**：{'、'.join(miss_stk)}")
+
+        lines.append("")
+        lines.append("写稿要求：")
+        if not have_idx:
+            lines.append("· 指数全部缺失——不要写指数点位、不要编造涨跌幅、不要用「大盘收涨」"
+                         "这类需要指数支撑的表述；改为只写板块轮动，"
+                         "并在开头说明「本期指数数据缺失，仅呈现板块表现」。")
+        else:
+            lines.append(f"· 指数可用（{'、'.join(have_idx)}），照常写大盘。"
+                         "上面列出的缺失项**一律不要提及、更不要编造数值**，"
+                         "当它们不存在即可，不必向读者解释缺了什么。")
+        if miss_stk:
+            lines.append("· 个股异动榜按实际拿到的标的写，数量不足就少写几条，不要凑数。")
+        lines.append("· 消息②（要闻）不受影响，照常写。")
+        lines.append("=== DEGRADED_END ===")
+        degraded_note = "\n".join(lines) + "\n\n"
+
+    # 交叉验证告警：CNBC 与 FMP 对不上时提示写稿方，但不影响正常出稿
+    degraded_note = (data.get("crosscheck_note") or "") + degraded_note
 
     idx = "\n".join(f"{name}: {fmt_quote(q.get(sym))}" for sym, name in INDICES)
     mac = " | ".join(f"{name} {fmt_quote(q.get(sym))}" for sym, name in MACRO)
@@ -350,7 +683,8 @@ def build_context(data: dict) -> str:
 
     spx = q.get(".SPX", {})
     return (
-        f"【收盘交易日】{data['session']}\n"
+        degraded_note
+        + f"【收盘交易日】{data['session']}\n"
         f"----------------\n"
         f"【指数收盘】\n{idx}\n"
         f"标普 开{spx.get('open','?')} 高{spx.get('high','?')} 低{spx.get('low','?')} "
