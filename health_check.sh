@@ -6,7 +6,6 @@
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 BOT_NAME="US Stock Bot"
-MAIN_PLIST="$HOME/Library/LaunchAgents/com.shirley.us-stock-bot.plist"
 
 # 终态 WARN 的匹配模式。⚠️ 必须与 stock_report.py 里 write_log("WARN", ...) 的实际措辞
 # 一致——对不上就会把"正常的没东西可播"误判成缺跑，白派一次无头补跑。
