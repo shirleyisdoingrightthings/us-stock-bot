@@ -76,7 +76,6 @@ RSS × 4（CNBC 头条 / 财报 / MarketWatch / Fortune） ├─▶ stock_repor
 | 变量 | 说明 |
 |---|---|
 | `FEISHU_WEBHOOK` | 飞书机器人 webhook |
-| `FEISHU_SECRET` | 签名密钥，未开签名校验则留空 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | 本地代理 |
 
 ## 用法

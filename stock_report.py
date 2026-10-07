@@ -79,9 +79,8 @@ write_log = make_logger(LOG_FILE, JSONL_FILE)
 
 # ===== 配置 =====
 # 飞书自定义机器人：webhook 地址在群「设置 → 群机器人 → 添加机器人 → 自定义机器人」
-# 里取得。若在那里勾了「签名校验」，把密钥一并放进 FEISHU_SECRET；没勾就留空。
+# 里取得。
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
-FEISHU_SECRET  = os.getenv("FEISHU_SECRET",  "")
 
 # CNBC 免费 quote 接口，一次调用可取全部标的，无需 API key
 CNBC_QUOTE_URL = (
@@ -473,7 +472,7 @@ def send_report(text: str) -> int:
     sanitize 一次、在转换前完成：HTML 只是内部中间格式，清洗保证正文里的裸
     < > & 不会被标签解析吃掉。转 post、按 20KB 分页、失败重试都由
     bot_utils.send_feishu 统一负责（三个 bot 共用同一实现）。"""
-    return send_feishu(sanitize_html(text), FEISHU_WEBHOOK, FEISHU_SECRET)
+    return send_feishu(sanitize_html(text), FEISHU_WEBHOOK)
 
 
 # ===== 代理预检 + 端口自愈 =====
