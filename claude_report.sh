@@ -31,4 +31,13 @@ while IFS= read -r line; do
 done < <(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables" "$PLIST" \
     | sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\) = \(.*\)$/\1=\2/p')
 
+# 加密行情已并入美股收盘日报：若美股 plist 未配 COINGECKO_API_KEY，则从 crypto plist 补齐
+CRYPTO_PLIST="$HOME/Library/LaunchAgents/com.shirley.crypto-daily-bot.plist"
+if [ -z "${COINGECKO_API_KEY:-}" ] && [ -f "$CRYPTO_PLIST" ]; then
+    CG_KEY=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:COINGECKO_API_KEY" "$CRYPTO_PLIST" 2>/dev/null || true)
+    if [ -n "$CG_KEY" ]; then
+        export COINGECKO_API_KEY="$CG_KEY"
+    fi
+fi
+
 exec "$PY" stock_report.py --mode "$MODE"

@@ -81,6 +81,7 @@ write_log = make_logger(LOG_FILE, JSONL_FILE)
 # 飞书自定义机器人：webhook 地址在群「设置 → 群机器人 → 添加机器人 → 自定义机器人」
 # 里取得。
 FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 
 # CNBC 免费 quote 接口，一次调用可取全部标的，无需 API key
 CNBC_QUOTE_URL = (
@@ -398,6 +399,101 @@ def session_date(quotes: dict) -> str:
     return ""
 
 
+# ===== 加密核心行情（2026-11 合并自 crypto daily bot，仅保留行情指标，不抓加密新闻）=====
+def fetch_crypto_snapshot() -> dict:
+    """抓取核心币价（BTC/ETH/SOL/BNB/XRP/HYPE）、全球加密市值/BTC 市占率、恐惧贪婪指数。
+    任一子项失败均降级为“未知”，绝不阻断美股主流程。"""
+    cg_headers = {"x-cg-demo-api-key": COINGECKO_API_KEY} if COINGECKO_API_KEY else {}
+    prices = {k: "未知" for k in ("BTC", "ETH", "SOL", "BNB", "XRP", "HYPE")}
+    try:
+        url = (
+            "https://api.coingecko.com/api/v3/simple/price"
+            "?ids=bitcoin,ethereum,solana,binancecoin,ripple,hyperliquid"
+            "&vs_currencies=usd&include_24hr_change=true"
+        )
+        resp = SESSION.get(url, headers=cg_headers, timeout=15)
+        resp.raise_for_status()
+        pdata = resp.json()
+
+        def _fmt_cg(key: str) -> str:
+            d = pdata.get(key, {})
+            price = d.get("usd", 0)
+            change = d.get("usd_24h_change", 0) or 0
+            if not price:
+                return "未知"
+            sign = "+" if change >= 0 else ""
+            return f"${price:,.2f} ({sign}{change:.2f}%)"
+
+        prices = {
+            "BTC":  _fmt_cg("bitcoin"),
+            "ETH":  _fmt_cg("ethereum"),
+            "SOL":  _fmt_cg("solana"),
+            "BNB":  _fmt_cg("binancecoin"),
+            "XRP":  _fmt_cg("ripple"),
+            "HYPE": _fmt_cg("hyperliquid"),
+        }
+    except Exception as e:
+        print(f"[WARN] 加密币价抓取失败: {e}", file=sys.stderr)
+
+    global_mkt = {
+        "btc_dominance": "未知",
+        "total_market_cap_b": "未知",
+        "market_cap_change_24h": "未知",
+        "bull_bear_label": "未知",
+    }
+    try:
+        resp = SESSION.get("https://api.coingecko.com/api/v3/global",
+                           headers=cg_headers, timeout=15)
+        resp.raise_for_status()
+        d = resp.json().get("data", {})
+        btc_dom = d.get("market_cap_percentage", {}).get("btc", 0) or 0
+        total_mc = d.get("total_market_cap", {}).get("usd", 0) or 0
+        mc_chg = d.get("market_cap_change_percentage_24h_usd", 0) or 0
+        if btc_dom >= 58:
+            label = "BTC 主导（避险情绪，山寨承压）"
+        elif btc_dom >= 52:
+            label = "过渡区（BTC 与山寨拉锯）"
+        elif btc_dom >= 46:
+            label = "偏牛（资金轮动山寨）"
+        else:
+            label = "山寨季（高风险偏好）"
+        global_mkt = {
+            "btc_dominance": f"{btc_dom:.1f}%",
+            "total_market_cap_b": f"${total_mc / 1e9:,.0f}B",
+            "market_cap_change_24h": f"{'+' if mc_chg >= 0 else ''}{mc_chg:.2f}%",
+            "bull_bear_label": label,
+        }
+    except Exception as e:
+        print(f"[WARN] 加密全球市值抓取失败: {e}", file=sys.stderr)
+
+    fear_val, fear_label = "未知", "未知"
+    try:
+        resp = SESSION.get("https://api.alternative.me/fng/", timeout=10)
+        resp.raise_for_status()
+        item = resp.json()["data"][0]
+        fear_val, fear_label = item["value"], item["value_classification"]
+    except Exception as e:
+        print(f"[WARN] 恐惧贪婪主源(alternative.me)失败: {e}，改用 CMC 备用源", file=sys.stderr)
+        try:
+            now_ts = int(time.time())
+            resp = SESSION.get(
+                "https://api.coinmarketcap.com/data-api/v3/fear-greed/chart"
+                f"?start={now_ts - 86400 * 2}&end={now_ts}",
+                headers={"User-Agent": _UA}, timeout=10)
+            resp.raise_for_status()
+            point = resp.json()["data"]["dataList"][-1]
+            fear_val, fear_label = str(point["score"]), point["name"]
+        except Exception as e2:
+            print(f"[WARN] 恐惧贪婪备用源(CMC)也失败: {e2}", file=sys.stderr)
+
+    return {
+        "prices": prices,
+        "global": global_mkt,
+        "fear_val": fear_val,
+        "fear_label": fear_label,
+    }
+
+
 # ===== 新闻抓取 =====
 def build_news_context(entries: list) -> tuple:
     """整理新闻素材，返回 (news_lines, kept_per_source, drop_stats)。
@@ -601,8 +697,14 @@ def gather() -> dict:
         flag = f"  ⚠️ 零产（连续 {n} 天）" if s["kept"] == 0 else ""
         print(f"   {d:26s} 抓{s['fetched']:>2} → 留{s['kept']:>2}{flag}", file=sys.stderr)
 
+    print("\n🪙 抓取加密核心行情...", file=sys.stderr)
+    crypto = fetch_crypto_snapshot()
+    print(f"  ✓ BTC {crypto['prices'].get('BTC', '未知')} | 恐贪指数 {crypto['fear_val']} ({crypto['fear_label']})",
+          file=sys.stderr)
+
     return {"quotes": quotes, "session": sess, "degraded": degraded,
             "crosscheck_note": crosscheck_note,
+            "crypto": crypto,
             "news_lines": news_lines,
             "news_count": news_count, "entries": entries,
             "zero_sources": zero_sources, "source_stats": source_stats,
@@ -680,6 +782,16 @@ def build_context(data: dict) -> str:
     losers  = "\n".join(f"{s}: {p} ({c})" for s, _, p, c, _ in mv[-8:][::-1])
 
     spx = q.get(".SPX", {})
+    c = data.get("crypto") or {}
+    cp = c.get("prices", {})
+    cg = c.get("global", {})
+    crypto_block = (
+        f"BTC: {cp.get('BTC', '未知')} | ETH: {cp.get('ETH', '未知')} | SOL: {cp.get('SOL', '未知')}\n"
+        f"BNB: {cp.get('BNB', '未知')} | XRP: {cp.get('XRP', '未知')} | HYPE: {cp.get('HYPE', '未知')}\n"
+        f"全球加密市值: {cg.get('total_market_cap_b', '未知')} ({cg.get('market_cap_change_24h', '未知')}) | "
+        f"BTC 市占率: {cg.get('btc_dominance', '未知')}（{cg.get('bull_bear_label', '未知')}） | "
+        f"恐惧贪婪指数: {c.get('fear_val', '未知')} ({c.get('fear_label', '未知')})"
+    )
     return (
         degraded_note
         + f"【收盘交易日】{data['session']}\n"
@@ -689,6 +801,8 @@ def build_context(data: dict) -> str:
         f"52周高{spx.get('yrhiprice','?')} 52周低{spx.get('yrloprice','?')}\n"
         f"----------------\n"
         f"【宏观指标】\n{mac}\n"
+        f"----------------\n"
+        f"【加密核心行情（24h）】\n{crypto_block}\n"
         f"----------------\n"
         f"【板块表现（按涨跌幅排序）】\n{sec}\n"
         f"----------------\n"
@@ -704,13 +818,15 @@ def _summary_and_metrics(data: dict) -> tuple:
     q = data["quotes"]
     spx, ixic = q.get(".SPX", {}), q.get(".IXIC", {})
     vix = q.get(".VIX", {})
+    btc = (data.get("crypto") or {}).get("prices", {}).get("BTC", "?")
     summary = (f"收盘{data['session']} 标普{spx.get('last','?')}({spx.get('change_pct','?')}) "
                f"纳指{ixic.get('last','?')}({ixic.get('change_pct','?')}) "
-               f"VIX{vix.get('last','?')} → 抓取{len(data['entries'])}条 → 保留{data['news_count']}条")
+               f"VIX{vix.get('last','?')} BTC {btc} → 抓取{len(data['entries'])}条 → 保留{data['news_count']}条")
     metrics = {
         "session": data["session"],
         "spx": spx.get("last"), "spx_pct": spx.get("change_pct"),
         "ixic_pct": ixic.get("change_pct"), "vix": vix.get("last"),
+        "btc": btc,
         "rss_fetched": len(data["entries"]), "rss_kept": data["news_count"],
         "rss_zero_sources": data["zero_sources"],
         "rss_source_stats": data["source_stats"],
