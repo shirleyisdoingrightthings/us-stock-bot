@@ -123,7 +123,11 @@ RSS_SOURCES = [
     # 9-03 那轮 fetched=8 / kept=2，是五个源里留存率最低的；内容以聚合转载为主，
     # 与 CNBC 两个源高度重叠，占着抓取额度却很少进正文。不要再加回来。
     ("https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",   6, False),  # MarketWatch 市场（深度，日更约 2-3 条）
-    ("https://fortune.com/feed/fortune-feeds/?id=3230629",           10, True),   # Fortune（量大，约一半与美股无关，过闸门）
+    # 2026-11-06：撤掉泛商业杂志源 Fortune（约一半为职场/管理软文），
+    # 经实测对比（Investing.com 摘要与正文均被反爬清零、Benzinga 新闻/财报源 403），
+    # 替换为 Nasdaq 官方 Markets + Earnings 双源（与 CNBC/MarketWatch 零重合，且 100% 带结构化财报/市场数据摘要）：
+    ("https://www.nasdaq.com/feed/rssoutbound?category=Markets",      6, False),  # Nasdaq 市场动态与焦点个股
+    ("https://www.nasdaq.com/feed/rssoutbound?category=Earnings",     5, False),  # Nasdaq 财报电话会要点与业绩指引
 ]
 
 # ===== P2: 消息缓存（降级策略）=====
