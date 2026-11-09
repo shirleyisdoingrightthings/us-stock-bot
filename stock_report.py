@@ -20,7 +20,9 @@
 """
 
 import os
+import re
 import sys
+import html
 import time
 import json
 import argparse
@@ -61,6 +63,9 @@ ZERO_STREAK  = Path(__file__).parent / "logs" / ".zero_streak.json"
 ZERO_STREAK_THRESHOLD = 3
 # 已播报过的交易日（避免周日/周一重复播上周五的收盘）
 LAST_SESSION = Path(__file__).parent / "logs" / ".last_session"
+# 跨日盘面状态记忆库（保留最近 5 个交易日的板块轮动、信号灯与关注方向，借鉴 claude-quickstarts State Store 设计）
+MARKET_MEMORY = Path(__file__).parent / "logs" / "market_memory.json"
+MAX_MEMORY_DAYS = 5
 
 # ===== P0: 显式代理配置 =====
 _PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
@@ -653,6 +658,45 @@ def fetch_us_ma_trends() -> dict:
     return out
 
 
+def _load_us_memory() -> list:
+    try:
+        if MARKET_MEMORY.exists():
+            rows = json.loads(MARKET_MEMORY.read_text(encoding="utf-8"))
+            if isinstance(rows, list):
+                return rows
+    except Exception:
+        pass
+    return []
+
+
+def _format_us_memory_block() -> str:
+    rows = _load_us_memory()[-MAX_MEMORY_DAYS:]
+    if not rows:
+        return "暂无历史盘面记忆（今日为首日建档）"
+    lines = ["（写稿提示：请对比下方前几日盘面记忆，在板块轮动与核心叙事中点出某板块是“连续多日领涨/领跌”还是“单日高低切换反转”，并在信号灯与分析师观点中复盘前日关注方向与信号灯变化。）"]
+    for r in rows:
+        g_str = "、".join(r.get("top3_gainers", []))
+        l_str = "、".join(r.get("top3_losers", []))
+        lines.append(
+            f"- [{r.get('session', '?')}] 指数：{r.get('indices', '?')}\n"
+            f"  · 领涨Top3：{g_str} | 领跌Top3：{l_str}\n"
+            f"  · 当日信号灯：{r.get('signal', '未知')} | 当日重点关注：{r.get('focus', '未知')}"
+        )
+    return "\n".join(lines)
+
+
+def _extract_us_signal_and_focus(report_text: str) -> tuple:
+    clean = re.sub(r"<[^>]+>", "", html.unescape(report_text))
+    sig, focus = "未知", "未知"
+    for raw_line in clean.splitlines():
+        line = raw_line.strip().lstrip("·•- ")
+        if line.startswith("信号灯状态") or line.startswith("美股信号灯"):
+            sig = re.sub(r"^[^：:]+[：:]\s*", "", line)[:90]
+        elif "重点关注" in line[:16] or line.startswith("关注方向"):
+            focus = re.sub(r"^[^：:]+[：:]\s*", "", line)[:110]
+    return sig, focus
+
+
 # ===== 汇总抓取 =====
 def gather() -> dict:
     print("📈 抓取行情...", file=sys.stderr)
@@ -930,6 +974,8 @@ def build_context(data: dict) -> str:
         degraded_note
         + f"【收盘交易日】{data['session']}\n"
         f"----------------\n"
+        f"【🧠 跨日盘面状态记忆（最近 5 个交易日板块轮动、信号灯与关注方向追踪）】\n{_format_us_memory_block()}\n"
+        f"----------------\n"
         f"【指数收盘】\n{idx}\n"
         f"标普 开{spx.get('open','?')} 高{spx.get('high','?')} 低{spx.get('low','?')} "
         f"52周高{spx.get('yrhiprice','?')} 52周低{spx.get('yrloprice','?')}\n"
@@ -1002,9 +1048,27 @@ def run_fetch() -> int:
         return 0
 
     summary, metrics = _summary_and_metrics(data)
+    q = data["quotes"]
+    sec_rows = []
+    for sym, name in SECTORS:
+        qq = q.get(sym)
+        if qq and _num(qq.get("change_pct")) is not None:
+            sec_rows.append((name, sym, qq.get("change_pct", "?"), _num(qq.get("change_pct"))))
+    sec_rows.sort(key=lambda r: -r[3])
+    spx_q, ixic_q, dji_q = q.get(".SPX", {}), q.get(".IXIC", {}), q.get(".DJI", {})
+    snapshot = {
+        "session": sess,
+        "indices": (
+            f"标普 {spx_q.get('last','?')}({spx_q.get('change_pct','?')}) | "
+            f"纳指 {ixic_q.get('last','?')}({ixic_q.get('change_pct','?')}) | "
+            f"道指 {dji_q.get('last','?')}({dji_q.get('change_pct','?')})"
+        ),
+        "top3_gainers": [f"{n}({s} {p})" for n, s, p, _ in sec_rows[:3]],
+        "top3_losers": [f"{n}({s} {p})" for n, s, p, _ in reversed(sec_rows[-3:])] if len(sec_rows) >= 3 else [],
+    }
     FETCH_META.write_text(
         json.dumps({"log_summary": summary, "metrics": metrics,
-                    "session": sess}, ensure_ascii=False),
+                    "session": sess, "snapshot": snapshot}, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -1075,6 +1139,23 @@ def run_send() -> int:
             LAST_SESSION.write_text(meta["session"], encoding="utf-8")
         except Exception as e:
             print(f"[WARN] .last_session 写入失败: {e}", file=sys.stderr)
+
+    # 更新最近 5 个交易日跨日盘面状态记忆库（State Store）
+    try:
+        snap = meta.get("snapshot") or {}
+        if snap.get("session"):
+            sig, focus = _extract_us_signal_and_focus(market)
+            entry = {**snap, "signal": sig, "focus": focus}
+            hist = [r for r in _load_us_memory() if r.get("session") != entry["session"]]
+            hist.append(entry)
+            MARKET_MEMORY.write_text(
+                json.dumps(hist[-MAX_MEMORY_DAYS:], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"  ✓ 已更新美股跨日盘面状态记忆库（保留最近 {len(hist[-MAX_MEMORY_DAYS:])} 个交易日）",
+                  file=sys.stderr)
+    except Exception as e:
+        print(f"[WARN] market_memory.json 写入失败: {e}", file=sys.stderr)
 
     duration = round(time.time() - t0, 1)
     write_log(
