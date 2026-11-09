@@ -584,11 +584,52 @@ def _proxy_ok() -> bool:
 
 
 
+# ===== 均线趋势与乖离率（2026-11 借鉴 daily_stock_analysis 新增）=====
+_US_MA_MAP = {
+    ".SPX": ("us.INX", "标普500"),
+    ".IXIC": ("us.IXIC", "纳斯达克"),
+    ".DJI": ("us.DJI", "道琼斯"),
+}
+
+
+def fetch_us_ma_trends() -> dict:
+    """直连腾讯财经日 K 接口拉取美股三大指数最近 25 日收盘价，计算 MA5/MA10/MA20 与 MA5 乖离率。"""
+    out = {}
+    s = requests.Session()
+    s.trust_env = False
+    s.proxies = {}
+    for cnbc_sym, (gt_code, label) in _US_MA_MAP.items():
+        try:
+            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={gt_code},day,,,25,qfq"
+            resp = s.get(url, headers={"User-Agent": _UA}, timeout=8)
+            klines = resp.json().get("data", {}).get(gt_code, {}).get("day") or []
+            closes = [float(r[2]) for r in klines if len(r) >= 3 and r[2]]
+            if len(closes) < 20:
+                continue
+            cur = closes[-1]
+            ma5 = sum(closes[-5:]) / 5.0
+            ma10 = sum(closes[-10:]) / 10.0
+            ma20 = sum(closes[-20:]) / 20.0
+            bias5 = (cur - ma5) / ma5 * 100.0 if ma5 else 0.0
+            if ma5 > ma10 > ma20:
+                trend = "🟢多头排列"
+            elif ma5 < ma10 < ma20:
+                trend = "🔴空头排列"
+            elif cur >= ma20:
+                trend = "🟡均线缠绕偏强(站上MA20)"
+            else:
+                trend = "🟡均线缠绕偏弱(跌破MA20)"
+            out[cnbc_sym] = f"{trend} | MA5={ma5:,.2f} (乖离率 {bias5:+.2f}%) | MA20={ma20:,.2f}"
+        except Exception:
+            continue
+    return out
+
+
 # ===== 汇总抓取 =====
 def gather() -> dict:
     print("📈 抓取行情...", file=sys.stderr)
     all_syms = ([s for s, _ in INDICES] + [s for s, _ in MACRO] +
-                [s for s, _ in SECTORS] + WATCHLIST)
+                [s for s, _ in SECTORS] + WATCHLIST + ["RSP"])
     quotes, degraded = {}, False
     try:
         quotes = fetch_quotes(all_syms)
@@ -706,9 +747,12 @@ def gather() -> dict:
     print(f"  ✓ BTC {crypto['prices'].get('BTC', '未知')} | 恐贪指数 {crypto['fear_val']} ({crypto['fear_label']})",
           file=sys.stderr)
 
+    ma_trends = fetch_us_ma_trends()
+
     return {"quotes": quotes, "session": sess, "degraded": degraded,
             "crosscheck_note": crosscheck_note,
             "crypto": crypto,
+            "ma_trends": ma_trends,
             "news_lines": news_lines,
             "news_count": news_count, "entries": entries,
             "zero_sources": zero_sources, "source_stats": source_stats,
@@ -786,6 +830,24 @@ def build_context(data: dict) -> str:
     losers  = "\n".join(f"{s}: {p} ({c})" for s, _, p, c, _ in mv[-8:][::-1])
 
     spx = q.get(".SPX", {})
+    rsp = q.get("RSP", {})
+    ma_trends = data.get("ma_trends") or {}
+    ma_lines = "\n".join(
+        f"{name} 均线趋势: {ma_trends[sym]}"
+        for sym, name in INDICES if ma_trends.get(sym)
+    ) or "均线数据暂缺"
+
+    # 市场宽度统计（11大板块涨跌比 + 28只核心权重股涨跌比 + 等权标普RSP对比）
+    sec_up = sum(1 for _, _, _, v in sec_rows if v is not None and v > 0)
+    sec_down = sum(1 for _, _, _, v in sec_rows if v is not None and v < 0)
+    stk_up = sum(1 for _, _, _, _, v in mv if v is not None and v > 0)
+    stk_down = sum(1 for _, _, _, _, v in mv if v is not None and v < 0)
+    breadth_block = (
+        f"11大GICS板块：{sec_up} 涨 {sec_down} 跌 | "
+        f"28只核心权重股：{stk_up} 涨 {stk_down} 跌 | "
+        f"等权标普(RSP)：{fmt_quote(rsp)}"
+    )
+
     c = data.get("crypto") or {}
     cp = c.get("prices", {})
     cg = c.get("global", {})
@@ -803,6 +865,8 @@ def build_context(data: dict) -> str:
         f"【指数收盘】\n{idx}\n"
         f"标普 开{spx.get('open','?')} 高{spx.get('high','?')} 低{spx.get('low','?')} "
         f"52周高{spx.get('yrhiprice','?')} 52周低{spx.get('yrloprice','?')}\n"
+        f"----------------\n"
+        f"【市场宽度与均线乖离率】\n{breadth_block}\n{ma_lines}\n"
         f"----------------\n"
         f"【宏观指标】\n{mac}\n"
         f"----------------\n"
