@@ -98,7 +98,35 @@ SECTORS = [("XLK", "科技"), ("XLC", "通信服务"), ("XLY", "可选消费"),
            ("XLP", "必需消费"), ("XLE", "能源"), ("XLF", "金融"),
            ("XLV", "医疗"), ("XLI", "工业"), ("XLB", "原材料"),
            ("XLRE", "房地产"), ("XLU", "公用事业")]
-# 重点个股：大市值 + 高关注度，用于挑出当日异动
+
+# 11 个 GICS 板块的核心成分股映射（用于排出领涨 Top 3 板块 & 领跌 Top 3 板块内各自的 Top 3 领涨/领跌个股）
+SECTOR_STOCKS = {
+    "XLK":  [("NVDA", "英伟达"), ("AAPL", "苹果"), ("MSFT", "微软"), ("AVGO", "博通"),
+             ("AMD", "AMD"), ("ORCL", "甲骨文"), ("CRM", "Salesforce"), ("MU", "美光"),
+             ("QCOM", "高通"), ("PLTR", "Palantir"), ("ADBE", "Adobe"), ("INTC", "英特尔")],
+    "XLC":  [("META", "Meta"), ("GOOGL", "Alphabet"), ("NFLX", "奈飞"),
+             ("TMUS", "T-Mobile"), ("DIS", "迪士尼"), ("VZ", "Verizon")],
+    "XLY":  [("AMZN", "亚马逊"), ("TSLA", "特斯拉"), ("HD", "家得宝"),
+             ("MCD", "麦当劳"), ("NKE", "耐克"), ("BKNG", "Booking")],
+    "XLP":  [("WMT", "沃尔玛"), ("COST", "好市多"), ("PG", "宝洁"),
+             ("KO", "可口可乐"), ("PEP", "百事"), ("PM", "菲利普莫里斯")],
+    "XLE":  [("XOM", "埃克森美孚"), ("CVX", "雪佛龙"), ("COP", "康菲石油"),
+             ("SLB", "斯伦贝谢"), ("EOG", "EOG能源"), ("OXY", "西方石油")],
+    "XLF":  [("BRK.B", "伯克希尔"), ("JPM", "摩根大通"), ("V", "Visa"),
+             ("MA", "万事达"), ("GS", "高盛"), ("COIN", "Coinbase")],
+    "XLV":  [("LLY", "礼来"), ("UNH", "联合健康"), ("JNJ", "强生"),
+             ("ABBV", "艾伯维"), ("MRK", "默沙东"), ("ISRG", "直觉外科")],
+    "XLI":  [("GE", "GE航空"), ("CAT", "卡特彼勒"), ("RTX", "雷神技术"),
+             ("UNP", "联合太平洋"), ("HON", "霍尼韦尔"), ("ETN", "伊顿")],
+    "XLB":  [("LIN", "林德气体"), ("NEM", "纽蒙特矿业"), ("FCX", "自由港麦克莫兰"),
+             ("SHW", "宣伟"), ("APD", "空气化工"), ("NUE", "纽柯钢铁")],
+    "XLRE": [("PLD", "安博"), ("AMT", "美国电塔"), ("EQIX", "Equinix"),
+             ("WELL", "Welltower"), ("SPG", "西蒙地产"), ("O", "Realty Income")],
+    "XLU":  [("NEE", "NextEra"), ("CEG", "Constellation核电"), ("VST", "Vistra电力"),
+             ("SO", "南方电力"), ("DUK", "杜克能源"), ("AEP", "美国电力")],
+}
+
+# 重点个股：大市值 + 高关注度（含 AI/芯片/加密映射股），用于全市场焦点异动与宽度统计
 WATCHLIST = ["NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AVGO",
              "AMD", "NFLX", "ORCL", "CRM", "ADBE", "INTC", "MU", "QCOM",
              "PLTR", "SMCI", "ARM", "TSM", "JPM", "BRK.B", "LLY", "UNH",
@@ -628,8 +656,11 @@ def fetch_us_ma_trends() -> dict:
 # ===== 汇总抓取 =====
 def gather() -> dict:
     print("📈 抓取行情...", file=sys.stderr)
-    all_syms = ([s for s, _ in INDICES] + [s for s, _ in MACRO] +
-                [s for s, _ in SECTORS] + WATCHLIST + ["RSP"])
+    sector_member_syms = [sym for members in SECTOR_STOCKS.values() for sym, _ in members]
+    all_syms = list(dict.fromkeys(
+        [s for s, _ in INDICES] + [s for s, _ in MACRO] +
+        [s for s, _ in SECTORS] + WATCHLIST + sector_member_syms + ["RSP"]
+    ))
     quotes, degraded = {}, False
     try:
         quotes = fetch_quotes(all_syms)
@@ -818,6 +849,43 @@ def build_context(data: dict) -> str:
     sec_rows.sort(key=lambda r: (r[3] is None, -(r[3] or 0)))
     sec = "\n".join(f"{n}({s}): {p}" for n, s, p, _ in sec_rows)
 
+    def _sector_top3_stocks(sec_sym: str, is_gainer: bool) -> str:
+        members = SECTOR_STOCKS.get(sec_sym, [])
+        items = []
+        for m_sym, m_cn in members:
+            mq = q.get(m_sym)
+            if mq and _num(mq.get("change_pct")) is not None:
+                items.append((m_sym, m_cn, mq.get("last", "?"),
+                              mq.get("change_pct", "?"), _num(mq.get("change_pct"))))
+        items.sort(key=lambda x: x[4], reverse=is_gainer)
+        top3 = items[:3]
+        if not top3:
+            return "暂无成分股行情"
+        return "、".join(f"{cn}({sym}) {last} ({pct})" for sym, cn, last, pct, _ in top3)
+
+    valid_secs = [r for r in sec_rows if r[3] is not None]
+    top3_gain_secs = valid_secs[:3]
+    top3_lose_secs = list(reversed(valid_secs[-3:])) if len(valid_secs) >= 3 else []
+
+    sec_top3_gain_lines = []
+    for idx_i, (n, s, p, _) in enumerate(top3_gain_secs, 1):
+        sec_top3_gain_lines.append(
+            f"{idx_i}. 【{n}({s})】 板块涨跌幅：{p}\n"
+            f"   · 板块内领涨 Top 3：{_sector_top3_stocks(s, is_gainer=True)}"
+        )
+    sec_top3_lose_lines = []
+    for idx_i, (n, s, p, _) in enumerate(top3_lose_secs, 1):
+        sec_top3_lose_lines.append(
+            f"{idx_i}. 【{n}({s})】 板块涨跌幅：{p}\n"
+            f"   · 板块内领跌 Top 3：{_sector_top3_stocks(s, is_gainer=False)}"
+        )
+    sec_detail_block = (
+        "🔥 领涨 Top 3 板块（及板块内涨幅 Top 3 个股）：\n"
+        + ("\n".join(sec_top3_gain_lines) or "未知")
+        + "\n\n❄️ 领跌 Top 3 板块（及板块内跌幅 Top 3 个股）：\n"
+        + ("\n".join(sec_top3_lose_lines) or "未知")
+    )
+
     # 个股按涨跌幅排序，取两端各 8 个作为异动榜
     mv = []
     for sym in WATCHLIST:
@@ -872,11 +940,13 @@ def build_context(data: dict) -> str:
         f"----------------\n"
         f"【加密核心行情（24h）】\n{crypto_block}\n"
         f"----------------\n"
-        f"【板块表现（按涨跌幅排序）】\n{sec}\n"
+        f"【11大板块表现（按涨跌幅排序）】\n{sec}\n"
         f"----------------\n"
-        f"【重点个股涨幅前 8】\n{gainers}\n"
+        f"【领涨 Top 3 板块 & 领跌 Top 3 板块（含各板块内 Top 3 个股）】\n{sec_detail_block}\n"
         f"----------------\n"
-        f"【重点个股跌幅前 8】\n{losers}\n"
+        f"【全市场焦点个股涨幅前 8】\n{gainers}\n"
+        f"----------------\n"
+        f"【全市场焦点个股跌幅前 8】\n{losers}\n"
         f"----------------\n\n"
         + "\n".join(data["news_lines"])
     )
