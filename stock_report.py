@@ -1122,6 +1122,18 @@ def run_send() -> int:
     CACHE_FILE.unlink(missing_ok=True)
     print("  ✓ 推送成功", file=sys.stderr)
 
+    # 自动同步归档到 Notion「每日情报归档与决策看板」数据库
+    try:
+        from notion_archive import archive_to_notion
+        combined_report = f"{market}\n\n---\n\n{news}"
+        ok, res = archive_to_notion(combined_report, "🗽 美股与加密")
+        if ok:
+            print(f"  ✓ 已同步归档至 Notion: {res}", file=sys.stderr)
+        else:
+            print(f"  [WARN] Notion 归档未完成: {res}", file=sys.stderr)
+    except Exception as e:
+        print(f"  [WARN] Notion 归档调用失败: {e}", file=sys.stderr)
+
     hrefs = extract_hrefs(market) + extract_hrefs(news)
     if hrefs:
         total = record_sent_urls(SENT_URLS, hrefs)
