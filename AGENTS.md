@@ -11,8 +11,8 @@
 - **消息①《美股收盘》** — 指数 / 宏观指标 / 板块轮动 / 个股异动 / 核心叙事 / 分析师观点
 - **消息②《美股要闻》** — 30秒速览 + 按 3/4/5 分评级排序的新闻条目
 
-写稿由 Claude 完成，本仓库的 `stock_report.py` 只负责抓取（`fetch`）与发送（`send`），
-全程零第三方大模型 API、零 token 成本。
+写稿由 Antigravity Sidecar 定时任务（Flash）完成，本仓库的 `stock_report.py` 只负责抓取（`fetch`）与发送（`send`），
+全程零第三方大模型 API、零 token 成本（已内嵌 24h 加密核心币价与情绪指标，独立 `crypto daily bot` 已退役）。
 
 ---
 
@@ -33,22 +33,20 @@
 
 ## 每日时间线
 
-```
-10:00  Claude routine（唯一写稿入口，实际 10:06 触发）
-         └─ claude_report.sh fetch → Claude 写两稿 → claude_report.sh send → run.log [OK/FAIL]
+```text
+10:00  Antigravity Sidecar（morning-catchup-daily-bots，周二至周六 10:00）
+         └─ claude_report.sh fetch → 写两稿 → claude_report.sh send → run.log [OK/FAIL]
 
-11:00  launchd ──▶ health_check.sh
+11:00  launchd（com.shirley.us-stock-bot-health）──▶ health_check.sh（Option B）
                         │
                   [OK] ──┼── .ok_streak +1（连续 3 次后清理 changelog）
                         │
-                  [NO_NEWS] ── 当天确实无新场次/无新闻，正常终态，不补跑
+                  [NO_NEWS] ── 当天确实无新场次/无新闻，正常终态
                         │
-                  [无记录] ── claude_catchup.sh 无头补跑
+                  [无记录] ── 仅告警；开机唤醒补跑由 Antigravity Sidecar 自行接管（不再拉起无头 CLI）
                         │
-                  [FAIL] ── changelog 新增条目 → auto_repair.sh（前台运行）
-                                  ├─ Level 1：等 30s 重跑 send
-                                  ├─ Level 2：claude CLI 诊断修复 → 重跑 send
-                                  └─ 最终兜底：claude_catchup.sh 无头补跑
+                  [FAIL] ── changelog 新增条目 → auto_repair.sh
+                                  └─ Level 1：若 drafts_fresh 则重跑 send；否则告警人工介入
 ```
 
 主 plist（`com.shirley.us-stock-bot`）**不承担调度**，ProgramArguments 是
@@ -128,16 +126,18 @@ FMP 的三个接口坑：
 > 两条技术事实备查：v8 chart **不支持批量**（一符号一请求，这是它无法取代 CNBC 的根本原因）；
 > `v7/finance/quote` 已需 crumb 认证（401），不可用。
 
-### 新闻：RSS × 4
+### 新闻：RSS × 5
 
 | 源 | 额度 | 定位 |
 |---|---|---|
 | CNBC 财经头条 | 10 | 宏观 + 市场 |
 | CNBC 盈利/财报 | 8 | 财报专线 |
 | MarketWatch 市场 | 6 | 深度，日更约 2-3 条 |
-| Fortune | 10 | 量大，约一半与美股无关，过闸门 |
+| Nasdaq Markets | 6 | 市场动态与焦点个股 |
+| Nasdaq Earnings | 5 | 财报电话会要点与业绩指引 |
 
 **选源标准：RSS 摘要或正文至少有一个能抓到。** 已排除：
+- `Fortune` —— 2026-11-06 撤除，约一半为非美股职场/管理软文，替换为 Nasdaq Markets + Earnings
 - `investing.com` —— 标题很好但摘要为空且正文被反爬拦截（实测 6 条全零内容）
 - Seeking Alpha —— 付费墙
 - Business Insider 市场源 —— 充斥律所集体诉讼通稿
@@ -147,7 +147,7 @@ FMP 的三个接口坑：
 
 ## 过滤链路
 
-```
+```text
 抓取 → URL 去重（单次运行内）
      → 跨天已播去重（logs/sent_urls.json，保留 7 天）
      → 48h 时间窗（比 AI bot 的 24h 宽：美股是隔夜市场，收盘解读常在次日发出）
@@ -159,14 +159,11 @@ FMP 的三个接口坑：
 
 ---
 
-## 与 Crypto Daily Bot 的分工
+## 加密核心行情合并与兜底说明
 
-两个 bot 会碰到同一家公司的新闻，分工写在 `prompt_news.md` 里：
-
-- **本 bot 管股权角度**：财报、股价、估值、评级、并购、管理层动作
-- **Crypto bot 管资产角度**：买卖了多少 BTC、对加密资产供需的影响
-
-例：MicroStrategy 增持比特币 → Crypto bot；MicroStrategy 财报与股价 → 本 bot。
+- **独立 `crypto daily bot` 已退役下线**：本 bot 在消息①内嵌 6 个核心币价（BTC/ETH/SOL/BNB/XRP/HYPE）、全球总市值、BTC 市占率与恐惧贪婪指数；纯加密内部事件在消息②要闻直接过滤不写。
+- **CNBC 兜底扩充**：FMP 兜底同时拉取 `WATCHLIST` 与 `SECTOR_STOCKS` 中落在 `FMP_STOCK_OK` 白名单内的代表股；Twelve Data 兜底顺带拉取等权标普 `RSP`（仍在同一批次配额内）。
+- **10 年期美债 `US10Y`**：主源 CNBC（`change * 100`）与兜底 FMP（相邻交易日差值 ` * 100`）统一按 `bp` 展示涨跌（如 `5.14% (+3.4bp)`），不写相对百分比。
 
 ---
 
@@ -175,12 +172,11 @@ FMP 的三个接口坑：
 | 文件 | 作用 | 改动频率 |
 |---|---|---|
 | `stock_report.py` | 主脚本：`--mode fetch` / `send` | 低 |
-| `claude_report.sh` | fetch/send 封装（从 plist 加载环境变量） | 极低 |
+| `claude_report.sh` | fetch/send 封装（委托 `../shared/report_base.sh`） | 极低 |
 | `prompt_market.md` | 消息①写稿规范（唯一权威源） | 中 |
-| `prompt_news.md` | 消息②写稿规范（唯一权威源） | 中 |
-| `health_check.sh` | 体检（11:00 由 launchd 触发） | 低 |
+| `prompt_news.md` | 消息②写稿规范（唯一权威源，软上限 12 条） | 中 |
+| `health_check.sh` | 轻量化体检（11:00 由 `~/Library/LaunchAgents/` 触发） | 低 |
 | `auto_repair.sh` | 薄包装 → `../shared/auto_repair_base.sh` | 极低 |
-| `claude_catchup.sh` | 薄包装 → `../shared/headless_catchup_base.sh` | 极低 |
 | `logs/report_market.txt` | 当日消息①稿件 | 每日 |
 | `logs/report_news.txt` | 当日消息②稿件 | 每日 |
 | `logs/fetch_meta.json` | fetch 边车：日志摘要 + 指标 | 每日 |
@@ -189,7 +185,7 @@ FMP 的三个接口坑：
 | `logs/sent_urls.json` | 跨天去重档案（保留 7 天） | 每日 |
 | `logs/.zero_streak.json` | 各源连续零产天数（fetch 单点写入） | 每日 |
 | `logs/.last_session` | 已播报过的收盘交易日 | 每日 |
-| `com.shirley.us-stock-bot-health.plist` | health_check launchd 配置（11:00 触发） | 极低 |
+| `logs/market_memory.json` | 最近 5 个交易日跨日盘面状态记忆库 | 每日 |
 
 ---
 

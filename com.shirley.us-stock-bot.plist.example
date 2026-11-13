@@ -18,11 +18,17 @@
              → 自定义机器人」里取得，形如 https://open.feishu.cn/open-apis/bot/v2/hook/xxxx -->
         <key>FEISHU_WEBHOOK</key>
         <string>YOUR_FEISHU_WEBHOOK_URL</string>
+        <key>COINGECKO_API_KEY</key>
+        <string>YOUR_COINGECKO_API_KEY</string>
+        <key>FMP_API_KEY</key>
+        <string>YOUR_FMP_API_KEY</string>
+        <key>TWELVEDATA_API_KEY</key>
+        <string>YOUR_TWELVEDATA_API_KEY</string>
 
         <key>HTTPS_PROXY</key>
-        <string>http://127.0.0.1:YOUR_PORT</string>
+        <string>http://127.0.0.1:1082</string>
         <key>HTTP_PROXY</key>
-        <string>http://127.0.0.1:YOUR_PORT</string>
+        <string>http://127.0.0.1:1082</string>
         <key>PATH</key>
         <string>/Users/YOUR_USER/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

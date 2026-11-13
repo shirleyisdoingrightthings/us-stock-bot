@@ -328,18 +328,27 @@ def fetch_treasury_10y(session_day: str = "") -> dict:
         return {}
     if not isinstance(rows, list) or not rows:
         return {}
-    pick = None
-    for row in rows:                       # 接口按日期倒序返回
+    pick_idx, pick = None, None
+    for idx, row in enumerate(rows):       # 接口按日期倒序返回
         if not session_day or (row.get("date") or "") <= session_day:
-            pick = row
+            pick_idx, pick = idx, row
             break
-    pick = pick or rows[0]
+    if pick is None:
+        pick_idx, pick = 0, rows[0]
     y10 = pick.get("year10")
     if y10 is None:
         return {}
+    bp_str = ""
+    if pick_idx + 1 < len(rows):
+        prev_y10 = rows[pick_idx + 1].get("year10")
+        if prev_y10 is not None:
+            try:
+                bp_str = f"{(float(y10) - float(prev_y10)) * 100:+.1f}bp"
+            except (TypeError, ValueError):
+                bp_str = ""
     note = "" if pick.get("date") == session_day else f"（{pick.get('date')}）"
     return {"US10Y": {"symbol": "US10Y", "last": f"{y10}%{note}",
-                      "change_pct": "", "last_time": ""}}
+                      "change_pct": bp_str, "last_time": ""}}
 
 
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
@@ -412,10 +421,20 @@ def fetch_quotes_twelvedata(symbols: list) -> dict:
 
 
 def fmt_quote(q: dict) -> str:
-    """格式化为「7,489.72 (+0.70%)」。"""
+    """格式化为「7,489.72 (+0.70%)」；10年期美债 US10Y 优先按 bp 格式化。"""
     if not q:
         return "未知"
-    return f"{q.get('last', '?')} ({q.get('change_pct', '?')})"
+    last = q.get("last", "?")
+    pct = q.get("change_pct", "")
+    if q.get("symbol") == "US10Y":
+        if str(pct).endswith("bp"):
+            return f"{last} ({pct})"
+        chg = _num(q.get("change"))
+        if chg is not None:
+            return f"{last} ({chg * 100:+.1f}bp)"
+    if pct:
+        return f"{last} ({pct})"
+    return f"{last}"
 
 
 def session_date(quotes: dict) -> str:
@@ -722,18 +741,18 @@ def gather() -> dict:
         # 仍然补不上的只有美元指数和个股异动榜，由 build_context 按实际缺项标注。
         print("[WARN] CNBC 无标普数据，启用兜底源（FMP 指数 + Twelve Data 板块）",
               file=sys.stderr)
-        # 指数/宏观 + 白名单内的个股一起要（个股用于异动榜，缺了榜就短一截）
-        fb1 = fetch_quotes_fmp([s for s, _ in INDICES] + [s for s, _ in MACRO]
-                               + [s for s in WATCHLIST if s in FMP_STOCK_OK])
+        # 指数/宏观 + 白名单内的个股与板块代表股一起要
+        fmp_stocks = list(dict.fromkeys([s for s in WATCHLIST + sector_member_syms if s in FMP_STOCK_OK]))
+        fb1 = fetch_quotes_fmp([s for s, _ in INDICES] + [s for s, _ in MACRO] + fmp_stocks)
         if fb1:
             quotes.update({k: v for k, v in fb1.items() if k not in quotes})
             n_idx = sum(1 for k in fb1 if k in FMP_SYMBOL_MAP)
             print(f"  ✓ FMP 取到 {n_idx} 个指数/宏观 + {len(fb1) - n_idx} 只个股",
                   file=sys.stderr)
-        fb2 = fetch_quotes_twelvedata([s for s, _ in SECTORS])
+        fb2 = fetch_quotes_twelvedata([s for s, _ in SECTORS] + ["RSP"])
         if fb2:
             quotes.update({k: v for k, v in fb2.items() if k not in quotes})
-            print(f"  ✓ Twelve Data 取到 {len(fb2)} 个板块 ETF", file=sys.stderr)
+            print(f"  ✓ Twelve Data 取到 {len(fb2)} 个 ETF（含 RSP）", file=sys.stderr)
         degraded = bool(fb1 or fb2)
 
     if not quotes:
@@ -1122,11 +1141,17 @@ def run_send() -> int:
     CACHE_FILE.unlink(missing_ok=True)
     print("  ✓ 推送成功", file=sys.stderr)
 
+    try:
+        meta = json.loads(FETCH_META.read_text(encoding="utf-8"))
+    except Exception:
+        meta = {"log_summary": "AI写稿", "metrics": {}, "session": ""}
+    sess_date = meta.get("session") or datetime.now().strftime("%Y-%m-%d")
+
     # 自动同步归档到 Notion「每日情报归档与决策看板」数据库
     try:
         from notion_archive import archive_to_notion
         combined_report = f"{market}\n\n---\n\n{news}"
-        ok, res = archive_to_notion(combined_report, "🗽 美股与加密")
+        ok, res = archive_to_notion(combined_report, "🗽 美股与加密", date_str=sess_date)
         if ok:
             print(f"  ✓ 已同步归档至 Notion: {res}", file=sys.stderr)
         else:
@@ -1139,11 +1164,6 @@ def run_send() -> int:
         total = record_sent_urls(SENT_URLS, hrefs)
         print(f"  ✓ 已归档 {len(hrefs)} 条链接用于跨天去重（档案共 {total} 条）",
               file=sys.stderr)
-
-    try:
-        meta = json.loads(FETCH_META.read_text(encoding="utf-8"))
-    except Exception:
-        meta = {"log_summary": "Claude写稿", "metrics": {}, "session": ""}
 
     # 记下已播报的收盘场次，供下次 fetch 判断有无新场次
     if meta.get("session"):
@@ -1172,8 +1192,8 @@ def run_send() -> int:
     duration = round(time.time() - t0, 1)
     write_log(
         "OK",
-        f"Claude写稿 → {meta.get('log_summary', '')} → 飞书推送成功",
-        metrics={**meta.get("metrics", {}), "ai_calls": 0, "source": "claude",
+        f"AI写稿 → {meta.get('log_summary', '')} → 飞书推送成功",
+        metrics={**meta.get("metrics", {}), "ai_calls": 0, "source": "antigravity",
                  "duration_s": duration},
     )
     return 0
@@ -1183,7 +1203,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="美股收盘日报")
     parser.add_argument(
         "--mode", choices=["fetch", "send"], required=True,
-        help="fetch=抓取并输出 context（供 Claude 写稿，零 API）/ send=发送 Claude 写好的两稿",
+        help="fetch=抓取并输出 context（零 API）/ send=发送写好的两稿",
     )
     parsed = parser.parse_args()
 
