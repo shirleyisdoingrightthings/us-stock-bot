@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from bot_utils import (sanitize_html, with_retry, fetch_rss, parse_entry_date,
                        already_ran_today, fetch_article_text,
                        url_key, load_sent_urls, record_sent_urls, extract_hrefs,
+                       archive_and_sync_notion,
                        send_feishu, update_zero_streak, is_market_relevant,
                        make_logger, make_pending_saver, proxy_ok,
                        emit_fetch_output)
@@ -1147,17 +1148,16 @@ def run_send() -> int:
         meta = {"log_summary": "AI写稿", "metrics": {}, "session": ""}
     sess_date = meta.get("session") or datetime.now().strftime("%Y-%m-%d")
 
-    # 自动同步归档到 Notion「每日情报归档与决策看板」数据库
-    try:
-        from notion_archive import archive_to_notion
-        combined_report = f"{market}\n\n---\n\n{news}"
-        ok, res = archive_to_notion(combined_report, "🗽 美股与加密", date_str=sess_date)
-        if ok:
-            print(f"  ✓ 已同步归档至 Notion: {res}", file=sys.stderr)
-        else:
-            print(f"  [WARN] Notion 归档未完成: {res}", file=sys.stderr)
-    except Exception as e:
-        print(f"  [WARN] Notion 归档调用失败: {e}", file=sys.stderr)
+    # 自动同步归档到 Notion「每日情报归档与决策看板」数据库，并留存合并文稿
+    combined_report = f"{market}\n\n---\n\n{news}"
+    notion_meta = archive_and_sync_notion(
+        combined_report,
+        "🗽 美股与加密",
+        date_str=sess_date,
+        archive_dir=DRAFT_MARKET.parent / "archive",
+        archive_filename=f"{sess_date}.txt",
+    )
+    notion_tag = " | Notion ✓" if notion_meta.get("notion_ok") else " | Notion ⚠️"
 
     hrefs = extract_hrefs(market) + extract_hrefs(news)
     if hrefs:
@@ -1192,8 +1192,8 @@ def run_send() -> int:
     duration = round(time.time() - t0, 1)
     write_log(
         "OK",
-        f"AI写稿 → {meta.get('log_summary', '')} → 飞书推送成功",
-        metrics={**meta.get("metrics", {}), "ai_calls": 0, "source": "antigravity",
+        f"AI写稿 → {meta.get('log_summary', '')} → 飞书推送成功{notion_tag}",
+        metrics={**meta.get("metrics", {}), **notion_meta, "ai_calls": 0, "source": "antigravity",
                  "duration_s": duration},
     )
     return 0
