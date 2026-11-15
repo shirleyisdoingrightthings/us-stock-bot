@@ -11,7 +11,7 @@
 - **消息①《美股收盘》** — 指数 / 宏观指标 / 板块轮动 / 个股异动 / 核心叙事 / 分析师观点
 - **消息②《美股要闻》** — 30秒速览 + 按 3/4/5 分评级排序的新闻条目
 
-写稿由 Antigravity Sidecar 定时任务（Flash）完成，本仓库的 `stock_report.py` 只负责抓取（`fetch`）与发送（`send`），
+写稿由 Antigravity Sidecar 定时任务（直接使用当前 Automation 选定模型）完成，本仓库的 `stock_report.py` 只负责抓取（`fetch`）与发送（`send`），
 全程零第三方大模型 API、零 token 成本（已内嵌 24h 加密核心币价与情绪指标，独立 `crypto daily bot` 已退役）。
 
 ---
