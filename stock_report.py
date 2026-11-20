@@ -42,7 +42,10 @@ from bot_utils import (sanitize_html, with_retry, fetch_rss, parse_entry_date,
                        archive_and_sync_notion,
                        send_feishu, update_zero_streak, is_market_relevant,
                        make_logger, make_pending_saver, proxy_ok,
-                       emit_fetch_output)
+                       emit_fetch_output,
+                       exa_enrich_enabled, exa_fetch_contents,
+                       exa_search_fallback, exa_agent_verify_catalysts,
+                       format_exa_catalyst_block)
 
 LOG_FILE   = Path(__file__).parent / "logs" / "run.log"
 JSONL_FILE = Path(__file__).parent / "logs" / "run.jsonl"
@@ -592,30 +595,204 @@ def build_news_context(entries: list) -> tuple:
         kept_per_source[src] = kept_per_source.get(src, 0) + 1
         picked.append((title, url, src, snippet))
 
+    _SKIP_EXA_TITLE_RE = re.compile(
+        r"(tipped to open|lower open predicted|should you avoid|here.?s why i.?m buying|"
+        r"market sharply lower|market may|stock market tipped)",
+        re.IGNORECASE,
+    )
+
     def _material(item):
         title, url, src, snippet = item
         body = fetch_article_text(url)
         text = body if body else snippet[:500]
         kind = "正文" if body else "摘要"
-        return src, text, (f"[原始英文标题] {title}\n[链接] {url}\n[媒体] {src}\n"
-                           f"[正文/摘要（{kind}）] {text}\n----")
+        return {"src": src, "title": title, "url": url, "text": text, "kind": kind}
 
     lines = []
     if picked:
         with ThreadPoolExecutor(max_workers=8) as ex:
-            results = list(ex.map(_material, picked))
+            rows = list(ex.map(_material, picked))
+
+        # Exa 轻量补全：对免费抓取失败（仅短摘要）的高价值新闻，先批量调 /contents，
+        # 仍为短摘要（如硬付费墙 WSJ 或缺数字的 CNBC 快讯）则对前 3 条补一次 /search。
+        if exa_enrich_enabled(default_enabled=True):
+            def _src_prio(src_name: str) -> int:
+                if "dowjones" in src_name or "wsj" in src_name:
+                    return 0
+                if "cnbc" in src_name:
+                    return 1
+                return 2
+
+            short_rows = [
+                r for r in rows
+                if r["kind"] == "摘要"
+                and len(r["text"].strip()) < 350
+                and not _SKIP_EXA_TITLE_RE.search(r["title"])
+            ]
+            short_rows.sort(key=lambda r: (_src_prio(r["src"]), len(r["text"])))
+            target_rows = short_rows[:6]
+            if target_rows:
+                exa_bodies = exa_fetch_contents([r["url"] for r in target_rows], max_chars=1600)
+                upgraded = 0
+                for r in target_rows:
+                    got = exa_bodies.get(url_key(r["url"]))
+                    if got and len(got) >= 300:
+                        r["text"] = got
+                        r["kind"] = "Exa补全正文"
+                        upgraded += 1
+                if upgraded:
+                    print(f"  ✓ Exa /contents 补全 {upgraded}/{len(target_rows)} 条短摘要正文", file=sys.stderr)
+
+                still_short = [r for r in target_rows if len(r["text"].strip()) < 280][:3]
+                if still_short:
+                    since_iso = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+                    searched = 0
+                    for r in still_short:
+                        hits = exa_search_fallback(
+                            r["title"],
+                            num_results=2,
+                            max_chars=750,
+                            start_published_date=since_iso,
+                        )
+                        snippets = [
+                            f"{h['title']}：{h['text'][:420]}"
+                            for h in hits if h.get("text")
+                        ]
+                        if snippets:
+                            r["text"] = f"{r['text']}\n[Exa补充背景] " + " | ".join(snippets)
+                            r["kind"] = "摘要+Exa补充"
+                            searched += 1
+                    if searched:
+                        print(f"  ✓ Exa /search 补全 {searched}/{len(still_short)} 条付费墙/短摘要背景", file=sys.stderr)
+
         # 内容闸门：正文和摘要都抓不到的条目直接丢弃。
         # 被反爬拦截的源（RSS 摘要为空 + 正文抓不到）会白占名额，让 Claude 只能
         # 对着一个标题硬写——宁可少一条也不要无米之炊。丢弃后同步扣减该源的
         # kept 计数，这样零产监测统计的是"真正可用的产出"而非"进了池子的条数"。
         MIN_USABLE = 50
-        for src, text, line in results:
-            if len(text.strip()) < MIN_USABLE:
+        for r in rows:
+            if len(r["text"].strip()) < MIN_USABLE:
                 drops["no_content"] = drops.get("no_content", 0) + 1
-                kept_per_source[src] = max(0, kept_per_source.get(src, 1) - 1)
+                kept_per_source[r["src"]] = max(0, kept_per_source.get(r["src"], 1) - 1)
                 continue
-            lines.append(line)
+            lines.append(
+                f"[原始英文标题] {r['title']}\n[链接] {r['url']}\n[媒体] {r['src']}\n"
+                f"[正文/摘要（{r['kind']}）] {r['text']}\n----"
+            )
     return lines, kept_per_source, drops
+
+
+_US_BRAND_ALIASES = {
+    "NVDA": ("nvidia",), "AAPL": ("apple",), "MSFT": ("microsoft",), "AVGO": ("broadcom",),
+    "AMD": ("advanced micro devices",), "ORCL": ("oracle",), "CRM": ("salesforce",),
+    "MU": ("micron",), "QCOM": ("qualcomm",), "PLTR": ("palantir",), "ADBE": ("adobe",),
+    "INTC": ("intel",), "SMCI": ("super micro", "supermicro"), "ARM": ("arm holdings",),
+    "TSM": ("tsmc", "taiwan semiconductor"), "META": ("meta platforms", "facebook"),
+    "GOOGL": ("alphabet", "google"), "NFLX": ("netflix",), "TMUS": ("t-mobile",),
+    "DIS": ("disney",), "VZ": ("verizon",), "AMZN": ("amazon",), "TSLA": ("tesla",),
+    "HD": ("home depot",), "MCD": ("mcdonald",), "NKE": ("nike",), "BKNG": ("booking",),
+    "WMT": ("walmart",), "COST": ("costco",), "PG": ("procter",), "KO": ("coca-cola",),
+    "PEP": ("pepsico",), "PM": ("philip morris",), "XOM": ("exxon",), "CVX": ("chevron",),
+    "COP": ("conocophillips",), "SLB": ("schlumberger",), "EOG": ("eog resources",),
+    "OXY": ("occidental",), "BRK.B": ("berkshire",), "JPM": ("jpmorgan", "jp morgan"),
+    "V": ("visa",), "MA": ("mastercard",), "GS": ("goldman sachs",), "COIN": ("coinbase",),
+    "MSTR": ("microstrategy", "strategy inc"), "LLY": ("eli lilly", "lilly"),
+    "UNH": ("unitedhealth",), "JNJ": ("johnson & johnson",), "ABBV": ("abbvie",),
+    "MRK": ("merck",), "ISRG": ("intuitive surgical",), "GE": ("ge aerospace",),
+    "CAT": ("caterpillar",), "RTX": ("raytheon", "rtx corp"), "UNP": ("union pacific",),
+    "HON": ("honeywell",), "ETN": ("eaton",), "LIN": ("linde",), "NEM": ("newmont",),
+    "FCX": ("freeport",), "SHW": ("sherwin-williams",), "APD": ("air products",),
+    "NUE": ("nucor",), "PLD": ("prologis",), "AMT": ("american tower",),
+    "EQIX": ("equinix",), "WELL": ("welltower",), "SPG": ("simon property",),
+    "O": ("realty income",), "NEE": ("nextera",), "CEG": ("constellation energy",),
+    "VST": ("vistra",), "SO": ("southern company",), "DUK": ("duke energy",),
+    "AEP": ("american electric",),
+}
+
+
+def _select_uncovered_us_movers(quotes: dict, news_lines: list, max_total: int = 6) -> list:
+    """挑出 RSS 新闻未覆盖、但在领涨/领跌板块 Top 3 或全市场焦点异动榜中波动显著的美股标的。"""
+    news_blob = "\n".join(news_lines)
+    news_low = news_blob.lower()
+
+    def _is_covered(sym: str) -> bool:
+        if len(sym) >= 3 and re.search(rf"\b{re.escape(sym)}\b", news_blob):
+            return True
+        for alias in _US_BRAND_ALIASES.get(sym, ()):
+            if alias in news_low:
+                return True
+        return False
+
+    # 汇总领涨/领跌 Top 3 板块内各自 Top 3 成分股 + 全市场 WATCHLIST 涨跌前 5
+    sec_rows = []
+    for sym, name in SECTORS:
+        qq = quotes.get(sym)
+        if qq and _num(qq.get("change_pct")) is not None:
+            sec_rows.append((name, sym, _num(qq.get("change_pct"))))
+    sec_rows.sort(key=lambda r: -r[2])
+    focus_secs = [(n, s, True) for n, s, _ in sec_rows[:3]] + [(n, s, False) for n, s, _ in sec_rows[-3:]]
+
+    sym_cn = {m_sym: m_cn for members in SECTOR_STOCKS.values() for m_sym, m_cn in members}
+    candidates = {}
+
+    def _consider(sym: str, sector_label: str):
+        qq = quotes.get(sym)
+        pct = _num(qq.get("change_pct")) if qq else None
+        if pct is None or _is_covered(sym):
+            return
+        if sym not in candidates:
+            candidates[sym] = {
+                "symbol": sym,
+                "name": sym_cn.get(sym) or qq.get("shortName") or sym,
+                "pct": pct,
+                "pct_change": qq.get("change_pct", f"{pct:+.2f}%"),
+                "sector": sector_label,
+            }
+
+    for sec_name, sec_sym, is_gainer in focus_secs:
+        members = []
+        for m_sym, _ in SECTOR_STOCKS.get(sec_sym, []):
+            mq = quotes.get(m_sym)
+            p = _num(mq.get("change_pct")) if mq else None
+            if p is not None:
+                members.append((m_sym, p))
+        members.sort(key=lambda x: x[1], reverse=is_gainer)
+        for m_sym, _ in members[:3]:
+            _consider(m_sym, f"{sec_name}({sec_sym})")
+
+    mv = []
+    for sym in WATCHLIST:
+        qq = quotes.get(sym)
+        p = _num(qq.get("change_pct")) if qq else None
+        if p is not None:
+            mv.append((sym, p))
+    mv.sort(key=lambda x: -x[1])
+    for sym, _ in mv[:5] + mv[-5:]:
+        _consider(sym, "全市场焦点权重")
+
+    all_rows = [r for r in candidates.values() if abs(r["pct"]) >= 1.5]
+    if not all_rows:
+        all_rows = sorted(candidates.values(), key=lambda r: -abs(r["pct"]))[:3]
+
+    gainers = sorted([r for r in all_rows if r["pct"] > 0], key=lambda r: -r["pct"])
+    losers = sorted([r for r in all_rows if r["pct"] < 0], key=lambda r: r["pct"])
+
+    # 兼顾涨跌两端：最多取 2 只领涨未覆盖股 + 4 只领跌未覆盖股，空余名额按绝对涨幅补足
+    picked = gainers[:2] + losers[:4]
+    if len(picked) < max_total:
+        used = {r["symbol"] for r in picked}
+        rest = sorted([r for r in all_rows if r["symbol"] not in used], key=lambda r: -abs(r["pct"]))
+        picked.extend(rest[: max_total - len(picked)])
+
+    return [
+        {
+            "symbol": r["symbol"],
+            "name": r["name"],
+            "pct_change": r["pct_change"],
+            "sector": r["sector"],
+        }
+        for r in picked[:max_total]
+    ]
 
 
 # ===== 推送飞书 =====
@@ -844,10 +1021,27 @@ def gather() -> dict:
 
     ma_trends = fetch_us_ma_trends()
 
+    exa_catalysts = []
+    if exa_enrich_enabled(default_enabled=True):
+        uncovered = _select_uncovered_us_movers(quotes, news_lines, max_total=6)
+        if uncovered:
+            print(
+                f"\n🔍 触发 Exa Agent 异动股定向催化补盲（{len(uncovered)} 只未命中 RSS）："
+                + "、".join(f"{u['symbol']}({u['pct_change']})" for u in uncovered),
+                file=sys.stderr,
+            )
+            exa_catalysts = exa_agent_verify_catalysts(
+                uncovered,
+                market_label="美股",
+                session_date=sess,
+                max_entities=6,
+            )
+
     return {"quotes": quotes, "session": sess, "degraded": degraded,
             "crosscheck_note": crosscheck_note,
             "crypto": crypto,
             "ma_trends": ma_trends,
+            "exa_catalysts": exa_catalysts,
             "news_lines": news_lines,
             "news_count": news_count, "entries": entries,
             "zero_sources": zero_sources, "source_stats": source_stats,
@@ -990,6 +1184,8 @@ def build_context(data: dict) -> str:
         f"BTC 市占率: {cg.get('btc_dominance', '未知')}（{cg.get('bull_bear_label', '未知')}） | "
         f"恐惧贪婪指数: {c.get('fear_val', '未知')} ({c.get('fear_label', '未知')})"
     )
+    exa_block = format_exa_catalyst_block(data.get("exa_catalysts") or [])
+    exa_section = f"{exa_block}\n----------------\n" if exa_block else ""
     return (
         degraded_note
         + f"【收盘交易日】{data['session']}\n"
@@ -1013,7 +1209,9 @@ def build_context(data: dict) -> str:
         f"【全市场焦点个股涨幅前 8】\n{gainers}\n"
         f"----------------\n"
         f"【全市场焦点个股跌幅前 8】\n{losers}\n"
-        f"----------------\n\n"
+        f"----------------\n"
+        + exa_section
+        + "\n"
         + "\n".join(data["news_lines"])
     )
 
