@@ -646,21 +646,40 @@ def build_news_context(entries: list) -> tuple:
                 still_short = [r for r in target_rows if len(r["text"].strip()) < 280][:3]
                 if still_short:
                     since_iso = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+                    _EARNINGS_RE = re.compile(
+                        r"\b(?:earnings|quarter|Q[1-4]|FY\d{2,4}|revenue|guidance|results|10-[KQ]|8-K|6-K|EPS|profit|beats?|misses?)\b",
+                        re.IGNORECASE,
+                    )
                     searched = 0
                     for r in still_short:
-                        hits = exa_search_fallback(
-                            r["title"],
-                            num_results=2,
-                            max_chars=750,
-                            start_published_date=since_iso,
+                        is_fin_report = (
+                            "earnings" in r["src"].lower()
+                            or "15839135" in r["src"]
+                            or bool(_EARNINGS_RE.search(r["title"]))
                         )
+                        hits = []
+                        if is_fin_report:
+                            hits = exa_search_fallback(
+                                r["title"],
+                                num_results=2,
+                                max_chars=750,
+                                category="financial report",
+                                start_published_date=since_iso,
+                            )
+                        if not hits:
+                            hits = exa_search_fallback(
+                                r["title"],
+                                num_results=2,
+                                max_chars=750,
+                                start_published_date=since_iso,
+                            )
                         snippets = [
                             f"{h['title']}：{h['text'][:420]}"
                             for h in hits if h.get("text")
                         ]
                         if snippets:
                             r["text"] = f"{r['text']}\n[Exa补充背景] " + " | ".join(snippets)
-                            r["kind"] = "摘要+Exa补充"
+                            r["kind"] = "摘要+Exa财报补充" if is_fin_report else "摘要+Exa补充"
                             searched += 1
                     if searched:
                         print(f"  ✓ Exa /search 补全 {searched}/{len(still_short)} 条付费墙/短摘要背景", file=sys.stderr)
